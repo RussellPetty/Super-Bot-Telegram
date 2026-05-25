@@ -40,6 +40,8 @@ def working_dir_for(chat_id: int) -> str:
     return CHAT_WORKING_DIRS.get(chat_id, WORKING_DIR)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+XAI_API_KEY = os.environ.get("XAI_API_KEY", "")
+XAI_TTS_VOICE = os.environ.get("XAI_TTS_VOICE", "ara")
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7[1m]")
 
 # Support-ticket → Telegram topic dispatch (optional; skipped if env missing)
@@ -49,9 +51,10 @@ SUPPORT_GROUP_ID = int(os.environ["SUPPORT_GROUP_ID"]) if os.environ.get("SUPPOR
 SUPPORT_PROJECT_DIR = os.environ.get("SUPPORT_PROJECT_DIR", "/Users/russellpetty/Desktop/broker-marketplace")
 SUPPORT_POLL_INTERVAL = int(os.environ.get("SUPPORT_POLL_INTERVAL", "20"))
 SUPPORT_REPLY_POLL_INTERVAL = int(os.environ.get("SUPPORT_REPLY_POLL_INTERVAL", "30"))
+SUPPORT_ARCHIVE_POLL_INTERVAL = int(os.environ.get("SUPPORT_ARCHIVE_POLL_INTERVAL", "60"))
 HOMI_HEADSHOT_URL = "https://mortgagemarketplace.ai/Homi.png"
-# Base URL for the broker-marketplace web app — used by /homi to hit the server-side endpoint
-# that creates the Homi note AND sends the user the notification email.
+# Base URL for the broker-marketplace web app — used by homi_reply.py to hit the server-side
+# endpoint that creates the Homi note AND sends the user the notification email.
 SUPPORT_API_BASE_URL = os.environ.get("SUPPORT_API_BASE_URL", "https://mortgagemarketplace.ai").rstrip("/")
 
 # Replies inside support-group forum topics should run claude in the project dir too.
@@ -235,6 +238,101 @@ def format_tool_result(event: dict) -> str | None:
     return None
 
 
+_MD_CODEBLOCK_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+_MD_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+_MD_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
+_MD_ITALIC_STAR_RE = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
+_MD_BOLD_UL_RE = re.compile(r"__([^_]+)__")
+_MD_ITALIC_UL_RE = re.compile(r"(?<!_)_([^_\n]+)_(?!_)")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MD_HEADER_RE = re.compile(r"^\s*#{1,6}\s*", re.MULTILINE)
+_MD_BULLET_RE = re.compile(r"^\s*[-*+]\s+", re.MULTILINE)
+
+
+def _strip_markdown_for_tts(text: str) -> str:
+    """Strip basic markdown so TTS doesn't read formatting characters literally."""
+    text = _MD_CODEBLOCK_RE.sub(r"\1", text)
+    text = _MD_INLINE_CODE_RE.sub(r"\1", text)
+    text = _MD_BOLD_RE.sub(r"\1", text)
+    text = _MD_BOLD_UL_RE.sub(r"\1", text)
+    text = _MD_ITALIC_STAR_RE.sub(r"\1", text)
+    text = _MD_ITALIC_UL_RE.sub(r"\1", text)
+    text = _MD_LINK_RE.sub(r"\1", text)
+    text = _MD_HEADER_RE.sub("", text)
+    text = _MD_BULLET_RE.sub("", text)
+    return text.strip()
+
+
+async def send_tts_voice(chat, text: str, state: ChatState, thread_id: int | None = None) -> bool:
+    """Speak `text` via Grok TTS (Ara) and send as a Telegram voice note.
+
+    Falls back to `send_chunks` on any failure. Returns True iff a voice note was sent.
+    """
+    if not text.strip():
+        return False
+    if not XAI_API_KEY:
+        logger.warning("XAI_API_KEY not set — sending text instead of voice")
+        await send_chunks(chat, text, state, thread_id=thread_id)
+        return False
+
+    body = _strip_markdown_for_tts(text)
+    if not body:
+        return False
+    # Grok TTS REST caps at 15000 chars; keep some headroom.
+    if len(body) > 14500:
+        body = body[:14500].rsplit(" ", 1)[0] + "…"
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                "https://api.x.ai/v1/tts",
+                headers={
+                    "Authorization": f"Bearer {XAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"text": body, "voice_id": XAI_TTS_VOICE, "language": "en"},
+            )
+            resp.raise_for_status()
+            mp3_bytes = resp.content
+    except Exception as e:
+        logger.error("Grok TTS request failed: %s — falling back to text", e)
+        await send_chunks(chat, text, state, thread_id=thread_id)
+        return False
+
+    mp3_path = f"/tmp/tts_{uuid.uuid4().hex}.mp3"
+    ogg_path = f"/tmp/tts_{uuid.uuid4().hex}.ogg"
+    try:
+        with open(mp3_path, "wb") as f:
+            f.write(mp3_bytes)
+        # Telegram only renders a true voice note (waveform) for OGG/OPUS.
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", mp3_path,
+            "-c:a", "libopus", "-b:a", "64k", "-ar", "48000",
+            ogg_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning("ffmpeg conversion failed: %s", stderr.decode(errors="replace")[:500])
+            await send_chunks(chat, text, state, thread_id=thread_id)
+            return False
+        with open(ogg_path, "rb") as f:
+            msg = await chat.send_voice(voice=f, message_thread_id=thread_id)
+            state.sent_message_ids.append(msg.message_id)
+        return True
+    except Exception as e:
+        logger.error("Sending voice note failed: %s — falling back to text", e)
+        await send_chunks(chat, text, state, thread_id=thread_id)
+        return False
+    finally:
+        for p in (mp3_path, ogg_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 async def run_claude_streaming(
     prompt: str,
     chat,
@@ -242,6 +340,7 @@ async def run_claude_streaming(
     state: ChatState,
     thread_id: int | None = None,
     cwd_override: str | None = None,
+    voice_reply: bool = False,
 ) -> None:
     """Run claude with stream-json output, sending updates as separate messages.
 
@@ -349,7 +448,10 @@ async def run_claude_streaming(
                         # Final response text — this is the only text we send
                         text = event.get("result", "").strip()
                         if text:
-                            await send_chunks(chat, text, state, thread_id=thread_id)
+                            if voice_reply:
+                                await send_tts_voice(chat, text, state, thread_id=thread_id)
+                            else:
+                                await send_chunks(chat, text, state, thread_id=thread_id)
                 except Exception as e:
                     logger.warning("Error processing event: %s", e)
                     continue
@@ -385,6 +487,7 @@ async def run_codex_streaming(
     reply_to,
     state: ChatState,
     thread_id: int | None = None,
+    voice_reply: bool = False,
 ) -> None:
     """Run codex exec with --json output, sending updates as separate messages."""
 
@@ -470,7 +573,10 @@ async def run_codex_streaming(
                         if itype == "agent_message":
                             text = item.get("text", "").strip()
                             if text:
-                                await send_chunks(chat, text, state, thread_id=thread_id)
+                                if voice_reply:
+                                    await send_tts_voice(chat, text, state, thread_id=thread_id)
+                                else:
+                                    await send_chunks(chat, text, state, thread_id=thread_id)
                                 state.codex_history.append(f"Codex: {text}")
 
                         elif itype == "command_execution":
@@ -789,9 +895,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     logger.info("Transcribed voice: %s", transcript[:100])
     if state.codex_mode:
-        await run_codex_streaming(transcript, update.message.chat, update.message, state, thread_id=thread_id)
+        await run_codex_streaming(transcript, update.message.chat, update.message, state, thread_id=thread_id, voice_reply=True)
     else:
-        await run_claude_streaming(transcript, update.message.chat, update.message, state, thread_id=thread_id)
+        await run_claude_streaming(transcript, update.message.chat, update.message, state, thread_id=thread_id, voice_reply=True)
 
 
 async def _process_debounced(chat, state: ChatState, thread_id: int | None) -> None:
@@ -1132,10 +1238,25 @@ async def _investigate_ticket(bot, ticket: dict, thread_id: int, attachment_path
         f"1. Query the Supabase `support_tickets` table via the Supabase MCP tools for PRIOR tickets related to this issue — "
         f"search by similar `message` text, same `current_page`, same `ticket_type`, or same error symptoms. "
         f"Read their `notes` arrays to see how similar problems were diagnosed and resolved; surface any recurring patterns.\n"
-        f"2. Investigate the codebase at {SUPPORT_PROJECT_DIR} and any relevant Supabase data.\n"
-        f"3. If you need more information from the user to diagnose the issue, DRAFT a reply asking the specific question and "
-        f"tell me to send it with `/homi <your draft>` (that command replies to the user as Homi from inside this thread).\n"
-        f"4. Identify the likely root cause and propose a specific fix.\n\n"
+        f"2. Pull recent production logs from Railway to find the user's actual server-side error. The Railway CLI is "
+        f"authenticated on this host and the `broker-marketplace`/`production` project is already linked from "
+        f"`{SUPPORT_PROJECT_DIR}`, so a plain `railway logs ...` invocation resolves correctly. Run:\n"
+        f"   `railway logs --service 113a809f-dd5d-4c08-915d-dd0052ad964d --lines 500`\n"
+        f"   That service UUID is the `Production!` Next.js app container (always pass the UUID — the `!` in the name "
+        f"breaks CLI resolution). Grep the output for the user's id (`{ticket.get('user_id','?')}`), their email, "
+        f"`{ticket.get('user_email','?')}`, or the page they were on. Useful flags: `--build` for build logs, "
+        f"`--http` for request logs, `--since 1h` (or `30m`, `1d`) to time-scope, `--json` for structured filtering. "
+        f"If the issue might be in a different service (Worker, Temporal Worker, marketplace-affiliate, etc.), "
+        f"run `railway service status --json --all` to list all service UUIDs.\n"
+        f"3. Investigate the codebase at {SUPPORT_PROJECT_DIR} and any relevant Supabase data.\n"
+        f"4. If you need more information from the user to diagnose the issue, DRAFT a reply asking the specific question. "
+        f"Show me the draft in this thread and WAIT for me to approve it (e.g. \"yes\", \"send it\", \"go\"). "
+        f"Once I approve, send it as Homi by piping the body into:\n"
+        f"   `python3 ~/claude-telegram/homi_reply.py --ticket-id {ticket_id}`\n"
+        f"   (Use a heredoc for multi-line bodies. The tool POSTs through the web app so the user gets the normal email.)\n"
+        f"   Exception: if the only reply needed is a pure thank-you / acknowledgment with no new information, "
+        f"send it directly without asking for approval.\n"
+        f"5. Identify the likely root cause and propose a specific fix.\n\n"
         f"DO NOT modify any code yet — wait for my reply in this thread before making changes."
     )
 
@@ -1223,8 +1344,10 @@ async def _handle_new_user_note(bot, client: httpx.AsyncClient, ticket: dict, th
         f"The user replied on ticket {ticket_id}:\n\n"
         f"{content or '(no text content)'}"
         f"{att_block}\n\n"
-        f"Incorporate this into your investigation. If you still need more information, draft another question and "
-        f"tell me to send it with `/homi <draft>`."
+        f"Incorporate this into your investigation. If you still need more information, draft another question, "
+        f"show it to me, and WAIT for my approval before sending. Once approved, send as Homi via:\n"
+        f"  `python3 ~/claude-telegram/homi_reply.py --ticket-id {ticket_id}` (body on stdin).\n"
+        f"Exception: a pure thank-you / acknowledgment reply can be sent directly without approval."
     )
 
     state = get_state(SUPPORT_GROUP_ID, thread_id)
@@ -1284,76 +1407,75 @@ async def poll_ticket_replies(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("poll_ticket_replies error: %s", e, exc_info=True)
 
 
-async def homi_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /homi <text> inside a support forum topic — append a staff note to the ticket as Homi."""
-    if not is_allowed(update):
+async def _fetch_pending_archive_tickets(client: httpx.AsyncClient) -> list[dict]:
+    """Closed/resolved tickets with a Telegram topic that haven't been archived yet."""
+    resp = await client.get(
+        f"{SUPABASE_URL}/rest/v1/support_tickets",
+        params={
+            "select": "id,telegram_topic_id",
+            "telegram_topic_id": "not.is.null",
+            "telegram_archived_at": "is.null",
+            "status": "in.(closed,resolved)",
+            "order": "resolved_at.asc.nullslast",
+            "limit": "20",
+        },
+        headers=_supabase_headers(),
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _mark_ticket_archived(client: httpx.AsyncClient, ticket_id: str) -> None:
+    resp = await client.patch(
+        f"{SUPABASE_URL}/rest/v1/support_tickets",
+        params={"id": f"eq.{ticket_id}"},
+        json={"telegram_archived_at": datetime.now(timezone.utc).isoformat()},
+        headers=_supabase_headers(),
+    )
+    resp.raise_for_status()
+
+
+async def poll_ticket_archives(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scheduled job: delete forum topics for tickets that have been resolved."""
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPPORT_GROUP_ID):
         return
-    msg = update.message
-    thread_id = msg.message_thread_id
-    if SUPPORT_GROUP_ID is None or msg.chat_id != SUPPORT_GROUP_ID or thread_id is None:
-        await msg.reply_text("⚠️ /homi must be used inside a support-ticket forum topic.")
-        return
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            tickets = await _fetch_pending_archive_tickets(client)
+            if not tickets:
+                return
+            logger.info("Deleting %d closed ticket topic(s)", len(tickets))
+            for ticket in tickets:
+                ticket_id = ticket.get("id")
+                topic_id = ticket.get("telegram_topic_id")
+                if not ticket_id or not topic_id:
+                    continue
+                missing_topic = False
+                try:
+                    await context.bot.delete_forum_topic(
+                        chat_id=SUPPORT_GROUP_ID,
+                        message_thread_id=int(topic_id),
+                    )
+                except Exception as e:
+                    msg = str(e).lower()
+                    # If the topic was already deleted by a human, stop retrying.
+                    if "not found" in msg or "topic_not_found" in msg or "thread not found" in msg:
+                        logger.warning("Topic %s for ticket %s already gone — marking archived", topic_id, ticket_id)
+                        missing_topic = True
+                    else:
+                        logger.error("Delete failed for ticket %s (topic %s): %s", ticket_id, topic_id, e)
+                        continue
 
-    text = msg.text or ""
-    parts = text.split(None, 1)
-    if len(parts) < 2 or not parts[1].strip():
-        await msg.reply_text("Usage: /homi <reply text to send to the user>")
-        return
-    body = parts[1].strip()
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            lookup = await client.get(
-                f"{SUPABASE_URL}/rest/v1/support_tickets",
-                params={
-                    "select": "id,user_email,user_name",
-                    "telegram_topic_id": f"eq.{thread_id}",
-                    "limit": "1",
-                },
-                headers=_supabase_headers(),
-            )
-            lookup.raise_for_status()
-        except Exception as e:
-            await msg.reply_text(f"❌ Lookup failed: {e}")
-            return
-
-        rows = lookup.json()
-        if not rows:
-            await msg.reply_text("⚠️ No ticket is linked to this forum topic.")
-            return
-
-        ticket = rows[0]
-        ticket_id = ticket["id"]
-
-        # POST through the web app so the user gets the normal "new response" email.
-        try:
-            post = await client.post(
-                f"{SUPPORT_API_BASE_URL}/api/support-tickets/{ticket_id}/homi-reply",
-                headers={
-                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={"content": body},
-            )
-        except Exception as e:
-            await msg.reply_text(f"❌ Homi-reply request failed: {e}")
-            return
-
-        if post.status_code >= 400:
-            await msg.reply_text(f"❌ Homi-reply endpoint returned {post.status_code}: {post.text[:400]}")
-            return
-
-        try:
-            note_id = (post.json().get("note") or {}).get("id")
-        except Exception:
-            note_id = None
-
-    # Mark this note as already-seen so the reply poller won't treat our own write as an incoming user reply.
-    if note_id:
-        _seen_ticket_notes.setdefault(ticket_id, set()).add(note_id)
-    _first_sight_tickets.add(ticket_id)
-
-    await msg.reply_text(f"✅ Replied as Homi to {ticket.get('user_email') or 'user'}.")
+                try:
+                    await _mark_ticket_archived(client, ticket_id)
+                    _seen_ticket_notes.pop(ticket_id, None)
+                    _first_sight_tickets.discard(ticket_id)
+                    if not missing_topic:
+                        logger.info("Deleted topic %s for ticket %s", topic_id, ticket_id)
+                except Exception as e:
+                    logger.error("Failed to mark ticket %s archived: %s", ticket_id, e)
+    except Exception as e:
+        logger.error("poll_ticket_archives error: %s", e, exc_info=True)
 
 
 def main() -> None:
@@ -1367,7 +1489,6 @@ def main() -> None:
     app.add_handler(CommandHandler("restart", restart_command))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("codex", codex_command))
-    app.add_handler(CommandHandler("homi", homi_command))
     app.add_handler(CommandHandler("attach", attach_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
@@ -1377,9 +1498,10 @@ def main() -> None:
     if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPPORT_GROUP_ID:
         app.job_queue.run_repeating(poll_tickets, interval=SUPPORT_POLL_INTERVAL, first=5)
         app.job_queue.run_repeating(poll_ticket_replies, interval=SUPPORT_REPLY_POLL_INTERVAL, first=15)
+        app.job_queue.run_repeating(poll_ticket_archives, interval=SUPPORT_ARCHIVE_POLL_INTERVAL, first=30)
         logger.info(
-            "Support pollers enabled (new=%ds, replies=%ds, group=%s)",
-            SUPPORT_POLL_INTERVAL, SUPPORT_REPLY_POLL_INTERVAL, SUPPORT_GROUP_ID,
+            "Support pollers enabled (new=%ds, replies=%ds, archives=%ds, group=%s)",
+            SUPPORT_POLL_INTERVAL, SUPPORT_REPLY_POLL_INTERVAL, SUPPORT_ARCHIVE_POLL_INTERVAL, SUPPORT_GROUP_ID,
         )
     else:
         logger.info("Support ticket poller disabled (missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / SUPPORT_GROUP_ID)")
