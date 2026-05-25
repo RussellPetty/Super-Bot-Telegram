@@ -1,1 +1,3 @@
 python-telegram-bot>=21.0
+httpx>=0.27
+telegramify-markdown>=0.5

@@ -1,35 +1,103 @@
-# Telegram Claude Bot
+# Claude-telegram
 
-A Telegram bot that bridges messages to Claude Code CLI with streaming updates.
+A Telegram bot that bridges chat messages to your choice of AI backend:
 
-## Setup
+- **Claude Code** — Anthropic's agentic `claude` CLI (best for code/tools)
+- **Codex** — OpenAI's `codex` CLI
+- **Ollama** — local models running on your own machine (private, free)
 
-1. Clone the repo:
+Streams tool calls and final responses back to Telegram with Markdown formatting,
+voice transcription (Whisper), and optional TTS voice replies (Grok Ara).
+
+## One-command install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RussellPetty/Claude-telegram/master/install.sh | bash
+```
+
+The installer is interactive: it picks a backend, installs the CLI for it, walks
+you through login, lets you choose a model, then asks for your Telegram bot
+token + user id. When it's done you can start the bot immediately.
+
+To install into a custom directory:
+
+```bash
+CT_INSTALL_DIR=~/my-bot curl -fsSL https://raw.githubusercontent.com/RussellPetty/Claude-telegram/master/install.sh | bash
+```
+
+Re-run anytime to reconfigure (the installer is idempotent and preserves any
+extra env vars you've added):
+
+```bash
+cd ~/claude-telegram && ./install.sh
+```
+
+## Manual install
+
+If you'd rather skip the installer:
+
+1. Clone & install Python deps in a venv:
    ```bash
-   git clone git@github.com:YOUR_USERNAME/telegram-claude-bot.git
-   cd telegram-claude-bot
+   git clone https://github.com/RussellPetty/Claude-telegram.git
+   cd Claude-telegram
+   python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
    ```
+2. Install your chosen backend (`npm i -g @anthropic-ai/claude-code`, `npm i -g @openai/codex`, or `brew install ollama`) and log in.
+3. Copy `.env.example` → `.env` and fill in your Telegram bot token + user id.
+4. Run `./run-forever.sh`.
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+## Running
 
-3. Create a `.env` file from the example:
-   ```bash
-   cp .env.example .env
-   ```
+```bash
+./run-forever.sh                  # foreground, restarts on crash
+nohup ./run-forever.sh > bot.stdout.log 2> bot.stderr.log &   # background
+```
 
-4. Edit `.env` and add your bot token and working directory.
+`run-forever.sh` re-sources `.env` on every restart, so editing `.env` and
+killing the python process is enough to pick up changes.
 
-5. Run the bot:
-   ```bash
-   ./run-forever.sh
-   ```
+## Commands inside Telegram
 
-## Commands
+| Command | What it does |
+|---|---|
+| `/start` | Welcome message |
+| `/new` | Reset session and clear chat history |
+| `/stop` | Kill the running AI process |
+| `/model` | List models for the current backend; reply with a number to pick |
+| `/codex` | Switch this chat to Codex |
+| `/ollama` | Switch this chat to Ollama |
+| `/term` | Next message runs as a shell command |
+| `/status` | Show current chat / session / mode |
+| `/attach <id>` | Resume an existing Claude session |
+| `/restart` | Restart the bot process |
 
-- `/start` — Welcome message
-- `/new` — Start a fresh Claude session
-- `/stop` — Stop the currently running Claude process
-- Send any text or photo to forward it to Claude
+To switch *back* to Claude from Codex/Ollama, run `/new` (also clears history)
+or `/model` (preserves Codex history; only works from Codex).
+
+## Backend cheat-sheet
+
+| | Claude Code | Codex | Ollama |
+|---|---|---|---|
+| Authoring tools (Read/Edit/Bash) | yes | yes | no (chat only) |
+| Cost | usage-billed | usage-billed | free (local) |
+| Network required | yes | yes | no |
+| Image input | yes | yes | no |
+| File input | yes | yes | inlined as text |
+
+The bot defaults each new chat to whatever `BOT_BACKEND=` is in `.env`. You can
+still flip backends at runtime per-chat with `/codex` and `/ollama`.
+
+## Env vars
+
+See `.env.example` for the full list. Required:
+
+- `TELEGRAM_BOT_TOKEN` — from @BotFather
+- `ALLOWED_USER_ID` — your numeric Telegram id (from @userinfobot)
+
+Useful optional:
+
+- `BOT_BACKEND` — `claude` (default) | `codex` | `ollama`
+- `CLAUDE_MODEL`, `OLLAMA_MODEL`, `OLLAMA_HOST`
+- `CLAUDE_WORKING_DIR` — default cwd for AI commands (defaults to `~`)
+- `OPENAI_API_KEY` — enables voice-message transcription via Whisper
+- `XAI_API_KEY` — enables TTS voice replies via Grok Ara

@@ -11,7 +11,12 @@ while true; do
         set +a
     fi
     echo "[$(date)] Starting bot..."
-    python3 "$SCRIPT_DIR/bot.py"
+    # Prefer the venv installed by install.sh; fall back to system python3.
+    if [ -x "$SCRIPT_DIR/venv/bin/python3" ]; then
+        "$SCRIPT_DIR/venv/bin/python3" "$SCRIPT_DIR/bot.py"
+    else
+        python3 "$SCRIPT_DIR/bot.py"
+    fi
     echo "[$(date)] Bot exited. Restarting in 5 seconds..."
     sleep 5
 done

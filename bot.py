@@ -44,6 +44,14 @@ XAI_API_KEY = os.environ.get("XAI_API_KEY", "")
 XAI_TTS_VOICE = os.environ.get("XAI_TTS_VOICE", "ara")
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7[1m]")
 
+# Ollama backend (used when state.ollama_mode is True or BOT_BACKEND=ollama)
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
+
+# Default backend for newly-seen chats: "claude" | "codex" | "ollama".
+# Users can still switch at runtime with /codex, /ollama, /model.
+DEFAULT_BACKEND = os.environ.get("BOT_BACKEND", "claude").lower()
+
 # Support-ticket → Telegram topic dispatch (optional; skipped if env missing)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -94,6 +102,8 @@ class ChatState:
     codex_thread_id: str | None = None
     codex_history: list[str] = field(default_factory=list)
     pending_codex_context: str | None = None
+    ollama_mode: bool = False
+    ollama_messages: list[dict] = field(default_factory=list)
     stop_requested: bool = False
     pending_text: list[str] = field(default_factory=list)
     debounce_task: asyncio.Task | None = None
@@ -115,8 +125,23 @@ def get_state(chat_id: int, thread_id: int | None = None) -> ChatState:
     """Get or create state keyed by (chat_id, thread_id) so forum topics are isolated."""
     key = (chat_id, thread_id)
     if key not in chats:
-        chats[key] = ChatState()
+        s = ChatState()
+        if DEFAULT_BACKEND == "codex":
+            s.codex_mode = True
+        elif DEFAULT_BACKEND == "ollama":
+            s.ollama_mode = True
+        chats[key] = s
     return chats[key]
+
+
+async def dispatch_to_backend(prompt, chat, reply_to, state, thread_id=None, voice_reply=False):
+    """Route a prompt to whichever backend this chat is currently in."""
+    if state.ollama_mode:
+        await run_ollama_streaming(prompt, chat, reply_to, state, thread_id=thread_id, voice_reply=voice_reply)
+    elif state.codex_mode:
+        await run_codex_streaming(prompt, chat, reply_to, state, thread_id=thread_id, voice_reply=voice_reply)
+    else:
+        await run_claude_streaming(prompt, chat, reply_to, state, thread_id=thread_id, voice_reply=voice_reply)
 
 
 def state_for(update: Update) -> ChatState:
@@ -612,6 +637,95 @@ async def run_codex_streaming(
             pass
 
 
+async def run_ollama_streaming(
+    prompt: str,
+    chat,
+    reply_to,
+    state: ChatState,
+    thread_id: int | None = None,
+    voice_reply: bool = False,
+) -> None:
+    """Stream a chat completion from a local Ollama server.
+
+    Maintains chat history in state.ollama_messages so the model gets multi-turn context.
+    Ollama itself doesn't expose tools/agentic behavior — it's plain chat.
+    """
+    model = state.model_override or OLLAMA_MODEL
+    state.ollama_messages.append({"role": "user", "content": prompt})
+
+    if reply_to is not None:
+        try:
+            await reply_to.set_reaction(ReactionTypeEmoji("👍"))
+        except Exception as e:
+            logger.error("Failed to set reaction: %s", e)
+
+    typing_active = True
+
+    async def keep_typing():
+        while typing_active:
+            try:
+                await chat.send_action(ChatAction.TYPING, message_thread_id=thread_id)
+            except Exception:
+                pass
+            await asyncio.sleep(8)
+
+    typing_task = asyncio.create_task(keep_typing())
+
+    full_response = ""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+            async with client.stream(
+                "POST",
+                f"{OLLAMA_HOST}/api/chat",
+                json={
+                    "model": model,
+                    "messages": state.ollama_messages,
+                    "stream": True,
+                },
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    raise RuntimeError(f"Ollama returned {resp.status_code}: {body.decode(errors='replace')[:500]}")
+                async for line in resp.aiter_lines():
+                    if state.stop_requested:
+                        break
+                    if not line.strip():
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunk = (event.get("message") or {}).get("content", "")
+                    if chunk:
+                        full_response += chunk
+                    if event.get("done"):
+                        break
+    except Exception as e:
+        logger.error("Ollama request failed: %s", e, exc_info=True)
+        await chat.send_message(f"❌ Ollama error: {e}", message_thread_id=thread_id)
+        # Drop the failed turn from history so the next message doesn't carry a dangling user turn
+        if state.ollama_messages and state.ollama_messages[-1].get("role") == "user":
+            state.ollama_messages.pop()
+        full_response = ""
+    finally:
+        typing_active = False
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
+        state.stop_requested = False
+
+    if not full_response.strip():
+        return
+
+    state.ollama_messages.append({"role": "assistant", "content": full_response})
+    if voice_reply:
+        await send_tts_voice(chat, full_response, state, thread_id=thread_id)
+    else:
+        await send_chunks(chat, full_response, state, thread_id=thread_id)
+
+
 async def run_terminal_command(command: str, chat, reply_to, state: ChatState, thread_id: int | None = None) -> None:
     """Run a shell command and relay output back to the chat."""
     working_msg = await reply_to.reply_text(f"🖥️ Running: `{command}`", parse_mode="Markdown")
@@ -660,10 +774,12 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     state = state_for(update)
     state.session_id = None
     state.model_override = None
-    state.codex_mode = False
+    state.codex_mode = (DEFAULT_BACKEND == "codex")
     state.codex_thread_id = None
     state.codex_history = []
     state.pending_codex_context = None
+    state.ollama_mode = (DEFAULT_BACKEND == "ollama")
+    state.ollama_messages = []
     state.announce_next_session_id = True
 
     chat_id = update.message.chat_id
@@ -727,7 +843,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state = state_for(update)
     running = "Yes" if state.active_proc is not None else "No"
     session = f"Active (`{state.session_id[:8]}...`)" if state.session_id else "Fresh (next message starts new)"
-    mode = "Terminal" if state.term_mode else ("Codex" if state.codex_mode else "Claude")
+    if state.term_mode:
+        mode = "Terminal"
+    elif state.ollama_mode:
+        mode = "Ollama"
+    elif state.codex_mode:
+        mode = "Codex"
+    else:
+        mode = "Claude"
     thread_id = update.message.message_thread_id
 
     lines = [
@@ -742,31 +865,50 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state.sent_message_ids.append(msg.message_id)
 
 
+async def _list_ollama_models() -> list[str]:
+    """Query the local Ollama server for installed models."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{OLLAMA_HOST}/api/tags")
+            resp.raise_for_status()
+            data = resp.json()
+            return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+    except Exception as e:
+        logger.warning("Failed to list ollama models: %s", e)
+        return []
+
+
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /model — list available models and let user pick one."""
+    """Handle /model — list available models for the current backend and let user pick one."""
     if not is_allowed(update):
         return
     state = state_for(update)
 
-    # Exit codex mode and seed Claude with codex history on next message
-    if state.codex_mode:
-        if state.codex_history:
-            transcript = "\n".join(state.codex_history)
-            state.pending_codex_context = (
-                "The user was previously working with Codex. Here is the conversation that took place:\n\n"
-                f"{transcript}\n\n"
-                "Continue assisting them, taking the above context into account."
-            )
-        state.codex_mode = False
-        state.codex_thread_id = None
-        state.codex_history = []
+    if state.ollama_mode:
+        models = await _list_ollama_models()
+        if not models:
+            models = [OLLAMA_MODEL]
+        header = "Ollama"
+    else:
+        # /model in codex mode swaps back to Claude (preserves prior behavior).
+        if state.codex_mode:
+            if state.codex_history:
+                transcript = "\n".join(state.codex_history)
+                state.pending_codex_context = (
+                    "The user was previously working with Codex. Here is the conversation that took place:\n\n"
+                    f"{transcript}\n\n"
+                    "Continue assisting them, taking the above context into account."
+                )
+            state.codex_mode = False
+            state.codex_thread_id = None
+            state.codex_history = []
+        models = ["claude-opus-4-7[1m]", "sonnet", "haiku"]
+        header = "Claude"
 
-    # Claude Code accepts these aliases; opus is pinned to 4.7 with 1M context
-    models = ["claude-opus-4-7[1m]", "sonnet", "haiku"]
     state.model_choices = models
 
     current = state.model_override or "default"
-    lines = [f"**Current model:** `{current}`\n", "**Pick a model** (reply with the number):\n"]
+    lines = [f"**{header} — current model:** `{current}`\n", "**Pick a model** (reply with the number):\n"]
     for i, m in enumerate(models, 1):
         check = " ✅" if m == state.model_override else ""
         lines.append(f"`{i}.` {m}{check}")
@@ -805,6 +947,7 @@ async def codex_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Since we can't easily read back message text from IDs alone,
     # we'll note the session switch and let the user continue from here
     state.codex_mode = True
+    state.ollama_mode = False
     state.codex_thread_id = None  # Fresh codex session
 
     msg = await update.message.reply_text(
@@ -825,6 +968,45 @@ async def codex_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         async with state.processing_lock:
             await run_codex_streaming(context_prompt, chat_obj, update.message, state, thread_id=thread_id)
+
+
+async def ollama_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /ollama — switch to Ollama mode (local model via http://localhost:11434)."""
+    if not is_allowed(update):
+        return
+    state = state_for(update)
+
+    if state.ollama_mode:
+        msg = await update.message.reply_text(
+            f"Already in Ollama mode (model: `{state.model_override or OLLAMA_MODEL}`). Use /model to pick a different one.",
+            parse_mode="Markdown",
+        )
+        state.sent_message_ids.append(msg.message_id)
+        return
+
+    # Confirm the Ollama server is up before flipping the mode.
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(f"{OLLAMA_HOST}/api/tags")
+            resp.raise_for_status()
+    except Exception as e:
+        msg = await update.message.reply_text(
+            f"❌ Can't reach Ollama at `{OLLAMA_HOST}` ({e}). Run `ollama serve` or `brew services start ollama`.",
+            parse_mode="Markdown",
+        )
+        state.sent_message_ids.append(msg.message_id)
+        return
+
+    state.ollama_mode = True
+    state.codex_mode = False
+    state.ollama_messages = []
+
+    msg = await update.message.reply_text(
+        f"🦙 Switched to **Ollama** mode (model: `{state.model_override or OLLAMA_MODEL}`).\n\n"
+        f"Use /model to pick a different installed model, or `/new` to swap back to the default backend.",
+        parse_mode="Markdown",
+    )
+    state.sent_message_ids.append(msg.message_id)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -894,10 +1076,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     logger.info("Transcribed voice: %s", transcript[:100])
-    if state.codex_mode:
-        await run_codex_streaming(transcript, update.message.chat, update.message, state, thread_id=thread_id, voice_reply=True)
-    else:
-        await run_claude_streaming(transcript, update.message.chat, update.message, state, thread_id=thread_id, voice_reply=True)
+    await dispatch_to_backend(transcript, update.message.chat, update.message, state, thread_id=thread_id, voice_reply=True)
 
 
 async def _process_debounced(chat, state: ChatState, thread_id: int | None) -> None:
@@ -914,10 +1093,7 @@ async def _process_debounced(chat, state: ChatState, thread_id: int | None) -> N
         return
 
     async with state.processing_lock:
-        if state.codex_mode:
-            await run_codex_streaming(combined, chat, reply_to, state, thread_id=thread_id)
-        else:
-            await run_claude_streaming(combined, chat, reply_to, state, thread_id=thread_id)
+        await dispatch_to_backend(combined, chat, reply_to, state, thread_id=thread_id)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -985,10 +1161,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         prompt = f"Read the image at {img_path} and describe what you see."
 
-    if state.codex_mode:
-        await run_codex_streaming(prompt, update.message.chat, update.message, state, thread_id=thread_id)
-    else:
-        await run_claude_streaming(prompt, update.message.chat, update.message, state, thread_id=thread_id)
+    if state.ollama_mode:
+        # Most local models can't read images from disk paths. Note this and skip the file read.
+        prompt = f"[user sent an image; saved at {img_path} but you can't read local files] " + prompt
+    await dispatch_to_backend(prompt, update.message.chat, update.message, state, thread_id=thread_id)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1012,10 +1188,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         prompt = f"Read the file at {doc_path} and describe its contents."
 
-    if state.codex_mode:
-        await run_codex_streaming(prompt, update.message.chat, update.message, state, thread_id=thread_id)
-    else:
-        await run_claude_streaming(prompt, update.message.chat, update.message, state, thread_id=thread_id)
+    if state.ollama_mode:
+        # Ollama can't read arbitrary local files; inline a short snippet instead.
+        try:
+            with open(doc_path, "r", encoding="utf-8", errors="replace") as f:
+                snippet = f.read(8000)
+            prompt = f"User sent a file ({filename}). Contents (first 8000 chars):\n\n{snippet}\n\nUser says: {caption or '(no caption)'}"
+        except Exception as e:
+            prompt = f"[user sent file {filename} but it couldn't be read as text: {e}] caption: {caption}"
+    await dispatch_to_backend(prompt, update.message.chat, update.message, state, thread_id=thread_id)
 
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
@@ -1489,6 +1670,7 @@ def main() -> None:
     app.add_handler(CommandHandler("restart", restart_command))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("codex", codex_command))
+    app.add_handler(CommandHandler("ollama", ollama_command))
     app.add_handler(CommandHandler("attach", attach_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
