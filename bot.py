@@ -519,15 +519,20 @@ async def run_codex_streaming(
     """Run codex exec with --json output, sending updates as separate messages."""
 
     cwd = working_dir_for(chat.id)
-    cmd = [
-        "codex", "exec",
+    cmd = ["codex", "exec"]
+    # Resume the same Codex session so multi-turn context carries across messages.
+    if state.codex_thread_id:
+        cmd.append("resume")
+    cmd.extend([
         "--dangerously-bypass-approvals-and-sandbox",
         "--json",
         "-C", cwd,
-        prompt,
-    ]
+    ])
     if state.model_override:
         cmd.extend(["-m", state.model_override])
+    if state.codex_thread_id:
+        cmd.append(state.codex_thread_id)
+    cmd.append(prompt)
 
     if reply_to is not None:
         try:
