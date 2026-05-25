@@ -348,11 +348,12 @@ XAI_KEY="$(ask_secret "xAI API key (enables TTS voice replies via Grok Ara)")"
 echo
 hr
 say "${B}Step 4 (optional) — Support-ticket investigation${N}"
-echo "  ${D}The bot can also auto-investigate support tickets from a codebase${N}"
-echo "  ${D}you maintain: opens a forum topic per ticket, runs Claude on it,${N}"
-echo "  ${D}forwards user replies, archives resolved threads.${N}"
-echo "  ${D}You'll need: a Telegram forum group, Supabase creds, and a${N}"
-echo "  ${D}web app that can POST new tickets to the bot's webhook.${N}"
+echo "  ${D}The bot opens a Telegram forum topic per ticket and runs Claude on${N}"
+echo "  ${D}your codebase to diagnose it. Replies/resolutions are driven by webhooks${N}"
+echo "  ${D}your web app POSTs to the bot — no shared DB needed. One bot can serve${N}"
+echo "  ${D}multiple codebases (each ticket payload can override the project dir).${N}"
+echo "  ${D}Supabase polling stays available as an OPTIONAL fallback for the${N}"
+echo "  ${D}broker-marketplace setup.${N}"
 echo
 
 EXISTING_PROJECT_DIR=""
@@ -385,7 +386,7 @@ DEFAULT_SUPPORT="N"
 
 ENABLE_SUPPORT="$(ask "Enable support-ticket investigation? [y/N]" "$DEFAULT_SUPPORT")"
 if [[ "$ENABLE_SUPPORT" =~ ^[Yy] ]]; then
-    SUPPORT_PROJECT_DIR="$(ask "Local path to the codebase to investigate" "${EXISTING_PROJECT_DIR:-$HOME/code/my-app}")"
+    SUPPORT_PROJECT_DIR="$(ask "Default codebase path (per-ticket payload can override)" "${EXISTING_PROJECT_DIR:-$HOME/code/my-app}")"
 
     echo
     echo "  ${D}Telegram group: the bot creates a forum topic per ticket here.${N}"
@@ -394,24 +395,9 @@ if [[ "$ENABLE_SUPPORT" =~ ^[Yy] ]]; then
     SUPPORT_GROUP_ID="$(ask "Telegram support group id (negative number)" "$EXISTING_GROUP_ID")"
 
     echo
-    echo "  ${D}Supabase (the bot reads/writes tickets, attachments, and reply notes here):${N}"
-    SUPABASE_URL="$(ask "Supabase project URL (https://xxx.supabase.co)" "$EXISTING_SUPABASE_URL")"
-    if [ -n "$EXISTING_SUPABASE_KEY" ]; then
-        KEEP_KEY="$(ask "Reuse existing service-role key from .env? [Y/n]" "Y")"
-        if [[ "$KEEP_KEY" =~ ^[Nn] ]]; then
-            SUPABASE_KEY="$(ask_secret "Supabase service-role key")"
-        else
-            SUPABASE_KEY="$EXISTING_SUPABASE_KEY"
-        fi
-    else
-        SUPABASE_KEY="$(ask_secret "Supabase service-role key")"
-    fi
-
-    echo
-    echo "  ${B}Webhook listener${N} — your web app POSTs new tickets here for instant"
-    echo "  dispatch (instead of waiting for the 20s Supabase poll)."
-    SUPPORT_WEBHOOK_PORT="$(ask "Local port for the webhook" "${EXISTING_WEBHOOK_PORT:-9091}")"
-    SUPPORT_WEBHOOK_BIND="$(ask "Bind address (127.0.0.1 = local-only; 0.0.0.0 = public)" "${EXISTING_WEBHOOK_BIND:-127.0.0.1}")"
+    echo "  ${B}Webhook listener${N} — your web app POSTs ticket events here."
+    SUPPORT_WEBHOOK_PORT="$(ask "Local port" "${EXISTING_WEBHOOK_PORT:-9091}")"
+    SUPPORT_WEBHOOK_BIND="$(ask "Bind address (127.0.0.1 = local-only, 0.0.0.0 = public)" "${EXISTING_WEBHOOK_BIND:-127.0.0.1}")"
 
     if [ -n "$EXISTING_WEBHOOK_TOKEN" ]; then
         REGEN="$(ask "Webhook token already exists in .env — regenerate? [y/N]" "N")"
@@ -425,20 +411,54 @@ if [[ "$ENABLE_SUPPORT" =~ ^[Yy] ]]; then
     fi
 
     echo
-    ok "Webhook URL: ${B}http://${SUPPORT_WEBHOOK_BIND}:${SUPPORT_WEBHOOK_PORT}/support-ticket${N}"
-    ok "Webhook token: ${B}${SUPPORT_WEBHOOK_TOKEN}${N}"
+    ENABLE_SUPABASE="$(ask "Also configure Supabase polling fallback? (only if your tickets are stored in a Supabase project the bot can read) [y/N]" "N")"
+    if [[ "$ENABLE_SUPABASE" =~ ^[Yy] ]]; then
+        SUPABASE_URL="$(ask "Supabase project URL (https://xxx.supabase.co)" "$EXISTING_SUPABASE_URL")"
+        if [ -n "$EXISTING_SUPABASE_KEY" ]; then
+            KEEP_KEY="$(ask "Reuse existing service-role key from .env? [Y/n]" "Y")"
+            if [[ "$KEEP_KEY" =~ ^[Nn] ]]; then
+                SUPABASE_KEY="$(ask_secret "Supabase service-role key")"
+            else
+                SUPABASE_KEY="$EXISTING_SUPABASE_KEY"
+            fi
+        else
+            SUPABASE_KEY="$(ask_secret "Supabase service-role key")"
+        fi
+    fi
+
+    BASE_URL="http://${SUPPORT_WEBHOOK_BIND}:${SUPPORT_WEBHOOK_PORT}"
     echo
-    echo "  ${D}Configure your web app to POST tickets like this:${N}"
-    echo "    ${D}curl -X POST http://${SUPPORT_WEBHOOK_BIND}:${SUPPORT_WEBHOOK_PORT}/support-ticket \\${N}"
-    echo "    ${D}  -H 'Authorization: Bearer ${SUPPORT_WEBHOOK_TOKEN}' \\${N}"
-    echo "    ${D}  -H 'Content-Type: application/json' \\${N}"
-    echo "    ${D}  -d '{\"id\":\"<ticket-uuid>\", \"user_name\":\"...\", \"user_email\":\"...\",${N}"
-    echo "    ${D}       \"message\":\"...\", \"current_page\":\"/...\", \"attachments\":[]}'${N}"
+    ok "Webhook base URL: ${B}${BASE_URL}${N}"
+    ok "Webhook token:    ${B}${SUPPORT_WEBHOOK_TOKEN}${N}"
+    echo
+    echo "  ${B}Endpoints${N} (all expect ${D}Authorization: Bearer <token>${N}):"
+    echo "    POST ${BASE_URL}/support-ticket           ${D}— new ticket → opens topic + investigates${N}"
+    echo "    POST ${BASE_URL}/support-ticket/reply     ${D}— user replied → posted to topic${N}"
+    echo "    POST ${BASE_URL}/support-ticket/resolved  ${D}— ticket closed → topic deleted${N}"
+    echo
+    echo "  ${D}Sample new-ticket call:${N}"
+    cat <<EOM
+    ${D}curl -X POST ${BASE_URL}/support-ticket \\
+      -H 'Authorization: Bearer <token>' \\
+      -H 'Content-Type: application/json' \\
+      -d '{
+        "id":           "<ticket-uuid>",
+        "user_name":    "Alice",
+        "user_email":   "alice@example.com",
+        "message":      "Cannot upload PDFs over 10 MB",
+        "current_page": "/upload",
+        "attachments":  [{"url":"https://example.com/screenshot.png","filename":"screenshot.png"}],
+        "project_dir":  "/path/to/this-codebase",
+        "reply_url":    "https://your-app.com/webhooks/homi-reply",
+        "reply_token":  "<your-own-shared-secret-for-Homi-replies>",
+        "metadata":     {"plan":"pro","build":"abc123"}
+      }'${N}
+EOM
     if [[ "$SUPPORT_WEBHOOK_BIND" == "127.0.0.1" ]]; then
         echo
         warn "Webhook is bound to localhost — only reachable from THIS machine."
-        echo "  ${D}If your web app runs elsewhere, either set bind=0.0.0.0 + open the${N}"
-        echo "  ${D}firewall, or front the port with cloudflared / ngrok / tailscale.${N}"
+        echo "  ${D}If your web app runs elsewhere, either re-run install.sh with bind=0.0.0.0,${N}"
+        echo "  ${D}or front the port with cloudflared / ngrok / tailscale-funnel.${N}"
     fi
 fi
 

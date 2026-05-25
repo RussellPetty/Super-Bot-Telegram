@@ -1673,58 +1673,368 @@ async def poll_ticket_archives(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─── Support-ticket webhook listener ──────────────────────────────────────────
+#
+# The webhook is a self-contained, Supabase-free way to drive the support flow
+# from any web app / codebase. Each ticket carries a `reply_url` that the bot
+# POSTs back to when Homi sends a message — so one bot can serve many code-
+# bases without any shared secret about them.
 
-async def _support_webhook_handler(request):
-    """POST /support-ticket — your web app calls this when a new ticket is created.
+TICKET_STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ticket_threads.json")
 
-    Headers: Authorization: Bearer <SUPPORT_WEBHOOK_TOKEN>
-    Body: ticket JSON (must have at minimum {"id": "..."}); typical fields:
-          id, user_id, user_name, user_email, ticket_type, current_page,
-          device_type, message, attachments.
+
+def _load_ticket_store() -> dict:
+    try:
+        with open(TICKET_STORE_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning("Failed to load ticket store: %s", e)
+        return {}
+
+
+def _save_ticket_store(data: dict) -> None:
+    try:
+        tmp = TICKET_STORE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, TICKET_STORE_PATH)
+    except Exception as e:
+        logger.error("Failed to save ticket store: %s", e)
+
+
+_ticket_threads: dict = _load_ticket_store()
+
+
+def _record_ticket(ticket_id: str, thread_id: int, ticket: dict) -> None:
+    _ticket_threads[ticket_id] = {
+        "thread_id": thread_id,
+        "reply_url": ticket.get("reply_url", ""),
+        "reply_token": ticket.get("reply_token", ""),
+        "project_dir": ticket.get("project_dir", "") or SUPPORT_PROJECT_DIR,
+        "user_name": ticket.get("user_name", ""),
+        "user_email": ticket.get("user_email", ""),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_ticket_store(_ticket_threads)
+
+
+def _resolve_ticket(payload: dict) -> tuple[str | None, int | None, dict]:
+    """Resolve {ticket_id, thread_id} from a reply/resolved payload."""
+    ticket_id = payload.get("ticket_id")
+    thread_id = payload.get("thread_id")
+    info: dict = {}
+    if ticket_id and ticket_id in _ticket_threads:
+        info = _ticket_threads[ticket_id]
+        thread_id = thread_id or info.get("thread_id")
+    elif thread_id:
+        for tid, i in _ticket_threads.items():
+            if i.get("thread_id") == thread_id:
+                ticket_id, info = tid, i
+                break
+    if isinstance(thread_id, str) and thread_id.isdigit():
+        thread_id = int(thread_id)
+    return ticket_id, thread_id, info
+
+
+async def _download_url(url: str, filename: str | None = None) -> str | None:
+    """Download a URL to /tmp; return the local path or None on failure."""
+    try:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+    except Exception as e:
+        logger.warning("Failed to fetch attachment %s: %s", url, e)
+        return None
+    safe_name = filename or url.rsplit("/", 1)[-1].split("?")[0] or "attachment"
+    path = f"/tmp/tg_att_{uuid.uuid4().hex}_{safe_name}"
+    try:
+        with open(path, "wb") as f:
+            f.write(resp.content)
+        return path
+    except Exception as e:
+        logger.warning("Failed to write attachment %s: %s", path, e)
+        return None
+
+
+def _build_intro(ticket: dict) -> str:
+    ticket_id = ticket.get("id", "?")
+    user_name = ticket.get("user_name") or "Unknown"
+    lines = ["*New support ticket*", ""]
+    lines.append(f"*User:* {user_name}" + (f" (`{ticket['user_id']}`)" if ticket.get("user_id") else ""))
+    if ticket.get("user_email"):    lines.append(f"*Email:* {ticket['user_email']}")
+    if ticket.get("ticket_type"):   lines.append(f"*Type:* {ticket['ticket_type']}")
+    if ticket.get("current_page"):  lines.append(f"*Page:* `{ticket['current_page']}`")
+    if ticket.get("device_type"):   lines.append(f"*Device:* {ticket['device_type']}")
+    lines.append(f"*Ticket ID:* `{ticket_id}`")
+    meta = ticket.get("metadata") or {}
+    if isinstance(meta, dict):
+        for k, v in meta.items():
+            lines.append(f"*{k}:* {v}")
+    lines.append("")
+    lines.append(f"*Message:*\n{ticket.get('message') or ''}")
+    return "\n".join(lines)
+
+
+async def _dispatch_webhook_ticket(bot, ticket: dict) -> int | None:
+    """Create a forum topic for an incoming webhook ticket and return its thread_id.
+
+    Webhook tickets are self-contained — no Supabase reads/writes happen here.
+    Attachments are fetched from the URLs the payload provides.
     """
+    ticket_id = ticket["id"]
+    user_name = ticket.get("user_name") or "Unknown"
+    first_line = (ticket.get("message") or "").strip().split("\n")[0]
+    snippet = first_line[:40] + ("…" if len(first_line) > 40 else "")
+    topic_name = f"{user_name[:20]} — {snippet}" if snippet else f"Ticket {ticket_id[:8]}"
+
+    try:
+        topic = await bot.create_forum_topic(chat_id=SUPPORT_GROUP_ID, name=topic_name)
+    except Exception as e:
+        logger.error("create_forum_topic failed for %s: %s", ticket_id, e)
+        return None
+    thread_id = topic.message_thread_id
+
+    try:
+        await bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=thread_id,
+            text=markdownify(_build_intro(ticket)),
+            parse_mode="MarkdownV2",
+        )
+    except Exception as e:
+        logger.error("Posting intro to topic %s failed: %s", thread_id, e)
+
+    attachment_paths: list[str] = []
+    for att in (ticket.get("attachments") or []):
+        url = (att or {}).get("url")
+        if not url:
+            continue
+        path = await _download_url(url, (att or {}).get("filename"))
+        if path:
+            attachment_paths.append(path)
+            await _send_attachment_to_topic(bot, thread_id, path)
+
+    _record_ticket(ticket_id, thread_id, ticket)
+    # Keep reply-poller bookkeeping happy if the Supabase fallback is also active.
+    _first_sight_tickets.add(ticket_id)
+    _seen_ticket_notes.setdefault(ticket_id, set())
+
+    asyncio.create_task(_investigate_webhook_ticket(bot, ticket, thread_id, attachment_paths))
+    return thread_id
+
+
+async def _investigate_webhook_ticket(bot, ticket: dict, thread_id: int, attachment_paths: list[str]) -> None:
+    ticket_id = ticket["id"]
+    project_dir = ticket.get("project_dir") or SUPPORT_PROJECT_DIR
+    user_name = ticket.get("user_name") or "Unknown"
+
+    att_block = ""
+    if attachment_paths:
+        att_block = "\n\nAttachments saved locally:\n" + "\n".join(f"- {p}" for p in attachment_paths)
+
+    investigation_prompt = (
+        f"You're investigating a support ticket from {user_name} ({ticket.get('user_email','?')}).\n\n"
+        f"Ticket id: {ticket_id}\n"
+        f"Page: {ticket.get('current_page','?')}\n"
+        f"Device: {ticket.get('device_type','?')}\n"
+        f"Type: {ticket.get('ticket_type','?')}\n\n"
+        f"*Their message:*\n{ticket.get('message','')}\n"
+        f"{att_block}\n\n"
+        f"Investigation steps:\n"
+        f"1. Investigate the codebase at {project_dir} for the root cause.\n"
+        f"2. If you need more info from the user, DRAFT a reply, show me in this thread, "
+        f"WAIT for my approval (e.g. \"yes\", \"send it\", \"go\"). Once approved, send by piping "
+        f"the body into:\n"
+        f"   `python3 {HOMI_REPLY_PATH} --ticket-id {ticket_id}`\n"
+        f"   (the helper looks up the reply URL from this ticket's record and POSTs there).\n"
+        f"   Exception: pure thank-you / acknowledgment replies can be sent directly.\n"
+        f"3. Identify the likely root cause and propose a specific fix.\n\n"
+        f"DO NOT modify any code yet — wait for my approval."
+    )
+
+    state = get_state(SUPPORT_GROUP_ID, thread_id)
+    state.session_id = None  # fresh Claude session per ticket
+    try:
+        chat_obj = await bot.get_chat(SUPPORT_GROUP_ID)
+        async with state.processing_lock:
+            await run_claude_streaming(
+                investigation_prompt, chat_obj, reply_to=None,
+                state=state, thread_id=thread_id, cwd_override=project_dir,
+            )
+    except Exception as e:
+        logger.error("Investigation failed for ticket %s: %s", ticket_id, e, exc_info=True)
+
+
+async def _handle_webhook_reply(bot, ticket_id: str, thread_id: int, content: str, info: dict) -> None:
+    project_dir = (info or {}).get("project_dir") or SUPPORT_PROJECT_DIR
+    prompt = (
+        f"The user replied on ticket {ticket_id}:\n\n{content or '(no text content)'}\n\n"
+        f"Incorporate this into your investigation. If you still need more information, draft "
+        f"another question, show it to me, and WAIT for my approval before sending. Once approved, "
+        f"send as Homi via:\n"
+        f"  `python3 {HOMI_REPLY_PATH} --ticket-id {ticket_id}` (body on stdin).\n"
+        f"Exception: a pure thank-you / acknowledgment reply can be sent directly."
+    )
+    state = get_state(SUPPORT_GROUP_ID, thread_id)
+    try:
+        chat_obj = await bot.get_chat(SUPPORT_GROUP_ID)
+        async with state.processing_lock:
+            await run_claude_streaming(
+                prompt, chat_obj, reply_to=None, state=state,
+                thread_id=thread_id, cwd_override=project_dir,
+            )
+    except Exception as e:
+        logger.error("Reply handler failed for ticket %s: %s", ticket_id, e, exc_info=True)
+
+
+def _check_webhook_auth(request) -> "aioweb.Response | None":  # noqa: F821
     from aiohttp import web as aioweb
     if not SUPPORT_WEBHOOK_TOKEN:
         return aioweb.json_response({"error": "webhook not configured"}, status=503)
     if SUPPORT_GROUP_ID is None:
         return aioweb.json_response({"error": "SUPPORT_GROUP_ID not set on bot"}, status=503)
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {SUPPORT_WEBHOOK_TOKEN}":
+    if request.headers.get("Authorization", "") != f"Bearer {SUPPORT_WEBHOOK_TOKEN}":
         return aioweb.json_response({"error": "unauthorized"}, status=401)
+    return None
+
+
+async def _support_webhook_handler(request):
+    """POST /support-ticket — open a forum topic for a new ticket.
+
+    Body: {
+      "id":           "<uuid>",       // required, unique per ticket
+      "user_name":    "...",
+      "user_email":   "...",
+      "user_id":      "...",
+      "ticket_type":  "...",
+      "current_page": "/...",
+      "device_type":  "...",
+      "message":      "...",
+      "metadata":     { ... },        // optional flat key/value, shown in intro
+      "attachments":  [ {"url":"https://...", "filename":"..."} ],
+      "project_dir":  "/path/to/repo",// optional override of SUPPORT_PROJECT_DIR
+      "reply_url":    "https://...",  // bot POSTs Homi replies here
+      "reply_token":  "..."           // sent as Bearer in the reply POST
+    }
+    """
+    from aiohttp import web as aioweb
+    err = _check_webhook_auth(request)
+    if err is not None:
+        return err
     try:
         ticket = await request.json()
     except Exception as e:
         return aioweb.json_response({"error": f"invalid json: {e}"}, status=400)
     if not isinstance(ticket, dict) or not ticket.get("id"):
         return aioweb.json_response({"error": "missing required field: id"}, status=400)
+    if ticket["id"] in _ticket_threads:
+        # Idempotent: return the existing thread instead of opening a duplicate.
+        existing = _ticket_threads[ticket["id"]]
+        return aioweb.json_response(
+            {"ok": True, "ticket_id": ticket["id"], "thread_id": existing.get("thread_id"), "duplicate": True}
+        )
 
     bot = request.app["bot"]
     logger.info("Webhook: dispatching ticket %s", ticket["id"])
+    thread_id = await _dispatch_webhook_ticket(bot, ticket)
+    if thread_id is None:
+        return aioweb.json_response({"error": "dispatch failed"}, status=500)
+    return aioweb.json_response({"ok": True, "ticket_id": ticket["id"], "thread_id": thread_id})
 
-    async def _go():
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                # _dispatch_ticket only uses context.bot — stub it.
-                ctx = type("Ctx", (), {"bot": bot})()
-                await _dispatch_ticket(ctx, client, ticket)
-        except Exception as e:
-            logger.error("Webhook dispatch for ticket %s failed: %s", ticket.get("id"), e, exc_info=True)
 
-    asyncio.create_task(_go())
-    return aioweb.json_response({"ok": True, "ticket_id": ticket["id"]})
+async def _support_reply_handler(request):
+    """POST /support-ticket/reply — your web app calls this when the end user
+    replies. Body: {ticket_id | thread_id, content, attachments, user_name}.
+    """
+    from aiohttp import web as aioweb
+    err = _check_webhook_auth(request)
+    if err is not None:
+        return err
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return aioweb.json_response({"error": f"invalid json: {e}"}, status=400)
+
+    ticket_id, thread_id, info = _resolve_ticket(payload)
+    if not thread_id:
+        return aioweb.json_response({"error": "unknown ticket — provide ticket_id or thread_id"}, status=404)
+    content = (payload.get("content") or "").strip()
+    attachments = payload.get("attachments") or []
+    if not content and not attachments:
+        return aioweb.json_response({"error": "empty reply (need content or attachments)"}, status=400)
+
+    bot = request.app["bot"]
+    user_name = payload.get("user_name") or info.get("user_name") or "User"
+    body = f"*{user_name} replied:*\n\n{content or '(no text)'}"
+    try:
+        await bot.send_message(
+            chat_id=SUPPORT_GROUP_ID, message_thread_id=int(thread_id),
+            text=markdownify(body), parse_mode="MarkdownV2",
+        )
+    except Exception as e:
+        logger.error("Posting reply to topic %s failed: %s", thread_id, e)
+        return aioweb.json_response({"error": str(e)}, status=500)
+
+    for att in attachments:
+        url = (att or {}).get("url")
+        if not url:
+            continue
+        path = await _download_url(url, (att or {}).get("filename"))
+        if path:
+            await _send_attachment_to_topic(bot, int(thread_id), path)
+
+    if ticket_id:
+        asyncio.create_task(_handle_webhook_reply(bot, ticket_id, int(thread_id), content, info))
+    return aioweb.json_response({"ok": True})
+
+
+async def _support_resolved_handler(request):
+    """POST /support-ticket/resolved — close the topic for a resolved ticket.
+    Body: {ticket_id | thread_id}.
+    """
+    from aiohttp import web as aioweb
+    err = _check_webhook_auth(request)
+    if err is not None:
+        return err
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return aioweb.json_response({"error": f"invalid json: {e}"}, status=400)
+
+    ticket_id, thread_id, _info = _resolve_ticket(payload)
+    if not thread_id:
+        return aioweb.json_response({"error": "unknown ticket"}, status=404)
+
+    bot = request.app["bot"]
+    try:
+        await bot.delete_forum_topic(chat_id=SUPPORT_GROUP_ID, message_thread_id=int(thread_id))
+    except Exception as e:
+        msg = str(e).lower()
+        if not ("not found" in msg or "topic_not_found" in msg or "thread not found" in msg):
+            logger.warning("delete_forum_topic for %s failed: %s", thread_id, e)
+    if ticket_id and ticket_id in _ticket_threads:
+        del _ticket_threads[ticket_id]
+        _save_ticket_store(_ticket_threads)
+        _seen_ticket_notes.pop(ticket_id, None)
+        _first_sight_tickets.discard(ticket_id)
+    return aioweb.json_response({"ok": True})
 
 
 async def _start_support_webhook(application):
     from aiohttp import web as aioweb
     aio_app = aioweb.Application()
     aio_app["bot"] = application.bot
-    aio_app.router.add_post("/support-ticket", _support_webhook_handler)
+    aio_app.router.add_post("/support-ticket",          _support_webhook_handler)
+    aio_app.router.add_post("/support-ticket/reply",    _support_reply_handler)
+    aio_app.router.add_post("/support-ticket/resolved", _support_resolved_handler)
     aio_app.router.add_get("/health", lambda r: aioweb.json_response({"ok": True}))
     runner = aioweb.AppRunner(aio_app)
     await runner.setup()
     site = aioweb.TCPSite(runner, SUPPORT_WEBHOOK_BIND, SUPPORT_WEBHOOK_PORT)
     await site.start()
     logger.info(
-        "Support webhook listening on http://%s:%d/support-ticket",
+        "Support webhook listening on http://%s:%d  (endpoints: /support-ticket, /support-ticket/reply, /support-ticket/resolved)",
         SUPPORT_WEBHOOK_BIND, SUPPORT_WEBHOOK_PORT,
     )
     return runner

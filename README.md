@@ -91,26 +91,62 @@ still flip backends at runtime per-chat with `/codex` and `/ollama`.
 
 ## Support-ticket investigation (optional)
 
-If you maintain a codebase and want the bot to auto-investigate support
-tickets, the installer's Step 4 wires this up: it asks for the local path to
-the codebase, a Telegram forum group id, Supabase creds (where tickets live),
-and stands up a webhook listener so your web app can POST new tickets for
-instant dispatch instead of waiting for the 20-second poll.
+The bot can open a Telegram forum topic per support ticket and run Claude on
+your codebase to diagnose it — driven entirely by webhooks from your web app.
+No shared database required, and one bot instance can serve multiple
+codebases (each ticket payload can override the project directory).
 
-The webhook accepts:
+### Endpoints
 
+All three require `Authorization: Bearer <SUPPORT_WEBHOOK_TOKEN>`. Bot returns
+JSON `{ok, ticket_id, thread_id}`.
+
+| Endpoint | When your app calls it | Body |
+|---|---|---|
+| `POST /support-ticket` | New ticket created | full ticket payload (see below) |
+| `POST /support-ticket/reply` | End user replied | `{ticket_id\|thread_id, content, attachments, user_name}` |
+| `POST /support-ticket/resolved` | Ticket closed | `{ticket_id\|thread_id}` |
+
+### New-ticket payload
+
+```jsonc
+{
+  "id":           "<uuid>",          // required, unique
+  "user_name":    "Alice",
+  "user_email":   "alice@example.com",
+  "user_id":      "<your-id>",
+  "ticket_type":  "bug",
+  "current_page": "/upload",
+  "device_type":  "iOS 17 / Safari",
+  "message":      "Cannot upload PDFs over 10 MB",
+  "metadata":     { "plan": "pro", "build": "abc123" }, // shown in intro
+  "attachments":  [ {"url": "https://...", "filename": "screenshot.png"} ],
+  "project_dir":  "/path/to/this-codebase",  // overrides SUPPORT_PROJECT_DIR
+  "reply_url":    "https://your-app.com/webhooks/homi-reply",
+  "reply_token":  "<shared-secret-for-the-reply-POST>"
+}
 ```
-POST http://<bind>:<port>/support-ticket
-Authorization: Bearer <SUPPORT_WEBHOOK_TOKEN>
-Content-Type: application/json
-{ "id": "<uuid>", "user_name": "...", "user_email": "...",
-  "message": "...", "current_page": "...", "attachments": [] }
-```
 
-On receipt the bot creates a forum topic, posts the ticket, downloads any
-attachments from Supabase storage, marks it dispatched, and kicks off a Claude
-investigation in that topic. Polling still runs as a fallback when Supabase is
-configured.
+### How replies from Homi flow back to your app
+
+When the human in the support topic approves a reply, the bot POSTs to the
+ticket's `reply_url` with `Authorization: Bearer <reply_token>` and body
+`{ticket_id, content}`. Your app is responsible for emailing / notifying the
+end user from there.
+
+### State
+
+Bot stores a `ticket_id → {thread_id, reply_url, reply_token, project_dir}`
+map in `./ticket_threads.json` (gitignored). The new-ticket endpoint is
+idempotent on `id` — duplicate POSTs return the existing thread instead of
+opening a second one.
+
+### Optional Supabase polling
+
+If you're running the broker-marketplace setup, the installer can also wire
+the Supabase poller as a fallback (the bot will read tickets from the
+`support_tickets` table and dispatch them the same way). This is purely
+optional and disabled by default.
 
 ## Env vars
 
