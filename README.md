@@ -1,4 +1,4 @@
-# Claude-telegram
+# Super-Bot-Telegram
 
 A Telegram bot that bridges chat messages to your choice of AI backend:
 
@@ -12,7 +12,7 @@ voice transcription (Whisper), and optional TTS voice replies (Grok Ara).
 ## One-command install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/RussellPetty/Claude-telegram/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/RussellPetty/Super-Bot-Telegram/master/install.sh | bash
 ```
 
 The installer is interactive: it picks a backend, installs the CLI for it, walks
@@ -22,14 +22,14 @@ token + user id. When it's done you can start the bot immediately.
 To install into a custom directory:
 
 ```bash
-CT_INSTALL_DIR=~/my-bot curl -fsSL https://raw.githubusercontent.com/RussellPetty/Claude-telegram/master/install.sh | bash
+CT_INSTALL_DIR=~/my-bot curl -fsSL https://raw.githubusercontent.com/RussellPetty/Super-Bot-Telegram/master/install.sh | bash
 ```
 
 Re-run anytime to reconfigure (the installer is idempotent and preserves any
 extra env vars you've added):
 
 ```bash
-cd ~/claude-telegram && ./install.sh
+cd ~/super-bot-telegram && ./install.sh
 ```
 
 ## Manual install
@@ -38,8 +38,8 @@ If you'd rather skip the installer:
 
 1. Clone & install Python deps in a venv:
    ```bash
-   git clone https://github.com/RussellPetty/Claude-telegram.git
-   cd Claude-telegram
+   git clone https://github.com/RussellPetty/Super-Bot-Telegram.git
+   cd Super-Bot-Telegram
    python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
    ```
 2. Install your chosen backend (`npm i -g @anthropic-ai/claude-code`, `npm i -g @openai/codex`, or `brew install ollama`) and log in.

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# install.sh — interactive installer for the Claude-telegram bot.
+# install.sh — interactive installer for Super-Bot-Telegram.
 #
 # One-liner:
-#   curl -fsSL https://raw.githubusercontent.com/RussellPetty/Claude-telegram/master/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/RussellPetty/Super-Bot-Telegram/master/install.sh | bash
 #
 # Re-run anytime to reconfigure.
 
 set -euo pipefail
 
-REPO_URL="https://github.com/RussellPetty/Claude-telegram.git"
-DEFAULT_INSTALL_DIR="$HOME/claude-telegram"
+REPO_URL="https://github.com/RussellPetty/Super-Bot-Telegram.git"
+DEFAULT_INSTALL_DIR="$HOME/super-bot-telegram"
 
 # ── Bootstrap: if piped from curl, clone repo then re-exec from it ────────────
 if [ ! -f "./bot.py" ] || [ ! -f "./install.sh" ]; then
@@ -71,7 +71,7 @@ esac
 
 clear || true
 echo "${B}╔══════════════════════════════════════════╗${N}"
-echo "${B}║   Claude-telegram bot installer          ║${N}"
+echo "${B}║   Super-Bot-Telegram installer           ║${N}"
 echo "${B}╚══════════════════════════════════════════╝${N}"
 echo
 echo "Repo:     $(pwd)"
@@ -243,8 +243,12 @@ esac
 echo
 hr
 say "${B}Step 3 — Telegram bot setup${N}"
-echo "  ${D}- Create a bot: open https://t.me/BotFather → /newbot → copy the token${N}"
-echo "  ${D}- Find your user id: open https://t.me/userinfobot → send /start${N}"
+echo
+echo "  ${D}Don't have a bot yet? Create one in 30 seconds:${N}"
+echo "  ${D}  1. Open https://t.me/BotFather and send /newbot${N}"
+echo "  ${D}  2. Pick a display name + a username ending in 'bot'${N}"
+echo "  ${D}  3. Copy the token BotFather sends back${N}"
+echo "  ${D}Everything else is automated via the Bot API.${N}"
 echo
 
 EXISTING_TOKEN=""
@@ -254,19 +258,84 @@ if [ -f ".env" ]; then
     EXISTING_USER="$(grep -E '^ALLOWED_USER_ID=' .env 2>/dev/null | cut -d= -f2- || true)"
 fi
 
-BOT_TOKEN=""
-while [ -z "$BOT_TOKEN" ]; do
-    BOT_TOKEN="$(ask "Telegram bot token (123456:ABC-…)" "$EXISTING_TOKEN")"
-done
+ask_userid_manual() {
+    local id=""
+    while [ -z "$id" ] || ! [[ "$id" =~ ^-?[0-9]+$ ]]; do
+        id="$(ask "Your Telegram user id (numeric — get it from https://t.me/userinfobot)")"
+        if ! [[ "$id" =~ ^-?[0-9]+$ ]]; then
+            warn "User id must be a number."
+            id=""
+        fi
+    done
+    echo "$id"
+}
 
-USER_ID=""
-while [ -z "$USER_ID" ] || ! [[ "$USER_ID" =~ ^-?[0-9]+$ ]]; do
-    USER_ID="$(ask "Your Telegram user id (numeric)" "$EXISTING_USER")"
-    if ! [[ "$USER_ID" =~ ^-?[0-9]+$ ]]; then
-        warn "User id must be a number."
-        USER_ID=""
+# Validate token (loops until accepted by Telegram) + auto-configure bot menu.
+BOT_USERNAME=""
+BOT_TOKEN=""
+while [ -z "$BOT_USERNAME" ]; do
+    while [ -z "$BOT_TOKEN" ]; do
+        BOT_TOKEN="$(ask "Telegram bot token (123456:ABC-…)" "$EXISTING_TOKEN")"
+    done
+    say "Validating token & configuring bot via Telegram API..."
+    if SETUP_OUT="$(python3 telegram-setup.py configure "$BOT_TOKEN" 2>&1)"; then
+        BOT_USERNAME="$(echo "$SETUP_OUT" | grep '^username=' | cut -d= -f2-)"
+        BOT_NAME="$(echo "$SETUP_OUT" | grep '^first_name=' | cut -d= -f2-)"
+        ok "Connected as @${BOT_USERNAME} (${BOT_NAME:-bot}) — commands menu + description set"
+    else
+        err "Telegram API rejected this token:"
+        echo "$SETUP_OUT" | grep -E '^(error|warn):' | head -5
+        EXISTING_TOKEN=""
+        BOT_TOKEN=""
     fi
 done
+
+# User id — keep existing, auto-detect, or type manually.
+echo
+say "${B}Your Telegram user id${N} (the bot only responds to you)"
+USER_ID=""
+if [ -n "$EXISTING_USER" ] && [[ "$EXISTING_USER" =~ ^-?[0-9]+$ ]]; then
+    KEEP="$(ask "Existing id in .env is $EXISTING_USER — keep it? [Y/n]" "Y")"
+    if [[ ! "$KEEP" =~ ^[Nn] ]]; then
+        USER_ID="$EXISTING_USER"
+        ok "Using existing user id: $USER_ID"
+    fi
+fi
+
+if [ -z "$USER_ID" ]; then
+    echo
+    echo "  1) ${C}Auto-detect${N} — tap Start in @$BOT_USERNAME and we read your id from the API"
+    echo "  2) ${C}Type manually${N} — get it from https://t.me/userinfobot first"
+    case "$(ask "Pick 1 or 2" "1")" in
+        2)
+            USER_ID="$(ask_userid_manual)"
+            ;;
+        *)
+            echo
+            echo "  Open this in Telegram (we'll also try to launch it for you):"
+            echo "    ${B}https://t.me/$BOT_USERNAME${N}"
+            echo "  Then tap ${B}Start${N} (or send any message)."
+            echo "  Waiting up to 3 minutes — Ctrl-C falls back to manual entry."
+            if [ "$PLATFORM" = macos ] && command -v open > /dev/null 2>&1; then
+                open "https://t.me/$BOT_USERNAME" 2>/dev/null || true
+            elif [ "$PLATFORM" = linux ] && command -v xdg-open > /dev/null 2>&1; then
+                xdg-open "https://t.me/$BOT_USERNAME" 2>/dev/null || true
+            fi
+            echo
+            if DETECT_OUT="$(python3 telegram-setup.py detect-user "$BOT_TOKEN" 180 2>&1)"; then
+                USER_ID="$(echo "$DETECT_OUT" | grep '^user_id=' | cut -d= -f2-)"
+                FIRST="$(echo "$DETECT_OUT" | grep '^user_first_name=' | cut -d= -f2-)"
+                UNAME="$(echo "$DETECT_OUT" | grep '^user_username=' | cut -d= -f2-)"
+                LABEL="${FIRST:-user}"
+                [ -n "$UNAME" ] && LABEL="$LABEL (@$UNAME)"
+                ok "Detected: $LABEL — id $USER_ID"
+            else
+                warn "Auto-detect timed out — falling back to manual entry."
+                USER_ID="$(ask_userid_manual)"
+            fi
+            ;;
+    esac
+fi
 
 WORK_DIR="$(ask "Default working directory for AI commands" "$HOME")"
 

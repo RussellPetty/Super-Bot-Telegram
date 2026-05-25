@@ -2,8 +2,8 @@
 """Post a Homi reply on a support ticket.
 
 Usage:
-    echo "body text" | python3 ~/claude-telegram/homi_reply.py --ticket-id <uuid>
-    python3 ~/claude-telegram/homi_reply.py --ticket-id <uuid> --text "body"
+    echo "body text" | python3 /path/to/homi_reply.py --ticket-id <uuid>
+    python3 /path/to/homi_reply.py --ticket-id <uuid> --text "body"
 
 Reads body from --text or stdin (stdin preferred for multi-line / markdown).
 Reuses the bot's env: SUPABASE_SERVICE_ROLE_KEY, SUPPORT_API_BASE_URL.

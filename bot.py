@@ -44,6 +44,8 @@ XAI_API_KEY = os.environ.get("XAI_API_KEY", "")
 XAI_TTS_VOICE = os.environ.get("XAI_TTS_VOICE", "ara")
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7[1m]")
 
+HOMI_REPLY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "homi_reply.py")
+
 # Ollama backend (used when state.ollama_mode is True or BOT_BACKEND=ollama)
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
@@ -1433,7 +1435,7 @@ async def _investigate_ticket(bot, ticket: dict, thread_id: int, attachment_path
         f"4. If you need more information from the user to diagnose the issue, DRAFT a reply asking the specific question. "
         f"Show me the draft in this thread and WAIT for me to approve it (e.g. \"yes\", \"send it\", \"go\"). "
         f"Once I approve, send it as Homi by piping the body into:\n"
-        f"   `python3 ~/claude-telegram/homi_reply.py --ticket-id {ticket_id}`\n"
+        f"   `python3 {HOMI_REPLY_PATH} --ticket-id {ticket_id}`\n"
         f"   (Use a heredoc for multi-line bodies. The tool POSTs through the web app so the user gets the normal email.)\n"
         f"   Exception: if the only reply needed is a pure thank-you / acknowledgment with no new information, "
         f"send it directly without asking for approval.\n"
@@ -1527,7 +1529,7 @@ async def _handle_new_user_note(bot, client: httpx.AsyncClient, ticket: dict, th
         f"{att_block}\n\n"
         f"Incorporate this into your investigation. If you still need more information, draft another question, "
         f"show it to me, and WAIT for my approval before sending. Once approved, send as Homi via:\n"
-        f"  `python3 ~/claude-telegram/homi_reply.py --ticket-id {ticket_id}` (body on stdin).\n"
+        f"  `python3 {HOMI_REPLY_PATH} --ticket-id {ticket_id}` (body on stdin).\n"
         f"Exception: a pure thank-you / acknowledgment reply can be sent directly without approval."
     )
 
