@@ -62,6 +62,12 @@ SUPPORT_PROJECT_DIR = os.environ.get("SUPPORT_PROJECT_DIR", "/Users/russellpetty
 SUPPORT_POLL_INTERVAL = int(os.environ.get("SUPPORT_POLL_INTERVAL", "20"))
 SUPPORT_REPLY_POLL_INTERVAL = int(os.environ.get("SUPPORT_REPLY_POLL_INTERVAL", "30"))
 SUPPORT_ARCHIVE_POLL_INTERVAL = int(os.environ.get("SUPPORT_ARCHIVE_POLL_INTERVAL", "60"))
+
+# Webhook listener: web app POSTs a ticket JSON here for immediate dispatch
+# (skipping the 20-second poll). Disabled if either var is empty.
+SUPPORT_WEBHOOK_PORT = int(os.environ.get("SUPPORT_WEBHOOK_PORT", "0") or "0")
+SUPPORT_WEBHOOK_TOKEN = os.environ.get("SUPPORT_WEBHOOK_TOKEN", "")
+SUPPORT_WEBHOOK_BIND = os.environ.get("SUPPORT_WEBHOOK_BIND", "127.0.0.1")
 HOMI_HEADSHOT_URL = "https://mortgagemarketplace.ai/Homi.png"
 # Base URL for the broker-marketplace web app — used by homi_reply.py to hit the server-side
 # endpoint that creates the Homi note AND sends the user the notification email.
@@ -1666,8 +1672,90 @@ async def poll_ticket_archives(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("poll_ticket_archives error: %s", e, exc_info=True)
 
 
+# ─── Support-ticket webhook listener ──────────────────────────────────────────
+
+async def _support_webhook_handler(request):
+    """POST /support-ticket — your web app calls this when a new ticket is created.
+
+    Headers: Authorization: Bearer <SUPPORT_WEBHOOK_TOKEN>
+    Body: ticket JSON (must have at minimum {"id": "..."}); typical fields:
+          id, user_id, user_name, user_email, ticket_type, current_page,
+          device_type, message, attachments.
+    """
+    from aiohttp import web as aioweb
+    if not SUPPORT_WEBHOOK_TOKEN:
+        return aioweb.json_response({"error": "webhook not configured"}, status=503)
+    if SUPPORT_GROUP_ID is None:
+        return aioweb.json_response({"error": "SUPPORT_GROUP_ID not set on bot"}, status=503)
+    auth = request.headers.get("Authorization", "")
+    if auth != f"Bearer {SUPPORT_WEBHOOK_TOKEN}":
+        return aioweb.json_response({"error": "unauthorized"}, status=401)
+    try:
+        ticket = await request.json()
+    except Exception as e:
+        return aioweb.json_response({"error": f"invalid json: {e}"}, status=400)
+    if not isinstance(ticket, dict) or not ticket.get("id"):
+        return aioweb.json_response({"error": "missing required field: id"}, status=400)
+
+    bot = request.app["bot"]
+    logger.info("Webhook: dispatching ticket %s", ticket["id"])
+
+    async def _go():
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # _dispatch_ticket only uses context.bot — stub it.
+                ctx = type("Ctx", (), {"bot": bot})()
+                await _dispatch_ticket(ctx, client, ticket)
+        except Exception as e:
+            logger.error("Webhook dispatch for ticket %s failed: %s", ticket.get("id"), e, exc_info=True)
+
+    asyncio.create_task(_go())
+    return aioweb.json_response({"ok": True, "ticket_id": ticket["id"]})
+
+
+async def _start_support_webhook(application):
+    from aiohttp import web as aioweb
+    aio_app = aioweb.Application()
+    aio_app["bot"] = application.bot
+    aio_app.router.add_post("/support-ticket", _support_webhook_handler)
+    aio_app.router.add_get("/health", lambda r: aioweb.json_response({"ok": True}))
+    runner = aioweb.AppRunner(aio_app)
+    await runner.setup()
+    site = aioweb.TCPSite(runner, SUPPORT_WEBHOOK_BIND, SUPPORT_WEBHOOK_PORT)
+    await site.start()
+    logger.info(
+        "Support webhook listening on http://%s:%d/support-ticket",
+        SUPPORT_WEBHOOK_BIND, SUPPORT_WEBHOOK_PORT,
+    )
+    return runner
+
+
+async def _on_startup(application):
+    if SUPPORT_WEBHOOK_PORT and SUPPORT_WEBHOOK_TOKEN and SUPPORT_GROUP_ID is not None:
+        try:
+            application._webhook_runner = await _start_support_webhook(application)
+        except Exception as e:
+            logger.error("Failed to start support webhook: %s", e, exc_info=True)
+
+
+async def _on_shutdown(application):
+    runner = getattr(application, "_webhook_runner", None)
+    if runner is not None:
+        try:
+            await runner.cleanup()
+        except Exception as e:
+            logger.warning("webhook cleanup error: %s", e)
+
+
 def main() -> None:
-    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .post_init(_on_startup)
+        .post_shutdown(_on_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("new", new_command))

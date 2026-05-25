@@ -344,15 +344,114 @@ echo "${D}Optional add-ons (press Enter to skip):${N}"
 OPENAI_KEY="$(ask_secret "OpenAI API key (enables voice-message transcription)")"
 XAI_KEY="$(ask_secret "xAI API key (enables TTS voice replies via Grok Ara)")"
 
-# ── Step 4: write .env ────────────────────────────────────────────────────────
+# ── Step 4 (optional): Support-ticket investigation ───────────────────────────
 echo
 hr
-say "${B}Step 4 — Writing config${N}"
+say "${B}Step 4 (optional) — Support-ticket investigation${N}"
+echo "  ${D}The bot can also auto-investigate support tickets from a codebase${N}"
+echo "  ${D}you maintain: opens a forum topic per ticket, runs Claude on it,${N}"
+echo "  ${D}forwards user replies, archives resolved threads.${N}"
+echo "  ${D}You'll need: a Telegram forum group, Supabase creds, and a${N}"
+echo "  ${D}web app that can POST new tickets to the bot's webhook.${N}"
+echo
 
-# Preserve any existing keys we don't know about (e.g. SUPPORT_*)
+EXISTING_PROJECT_DIR=""
+EXISTING_GROUP_ID=""
+EXISTING_SUPABASE_URL=""
+EXISTING_SUPABASE_KEY=""
+EXISTING_WEBHOOK_TOKEN=""
+EXISTING_WEBHOOK_PORT=""
+EXISTING_WEBHOOK_BIND=""
+if [ -f ".env" ]; then
+    EXISTING_PROJECT_DIR="$(grep -E '^SUPPORT_PROJECT_DIR=' .env 2>/dev/null | cut -d= -f2-)"
+    EXISTING_GROUP_ID="$(grep -E '^SUPPORT_GROUP_ID=' .env 2>/dev/null | cut -d= -f2-)"
+    EXISTING_SUPABASE_URL="$(grep -E '^SUPABASE_URL=' .env 2>/dev/null | cut -d= -f2-)"
+    EXISTING_SUPABASE_KEY="$(grep -E '^SUPABASE_SERVICE_ROLE_KEY=' .env 2>/dev/null | cut -d= -f2-)"
+    EXISTING_WEBHOOK_TOKEN="$(grep -E '^SUPPORT_WEBHOOK_TOKEN=' .env 2>/dev/null | cut -d= -f2-)"
+    EXISTING_WEBHOOK_PORT="$(grep -E '^SUPPORT_WEBHOOK_PORT=' .env 2>/dev/null | cut -d= -f2-)"
+    EXISTING_WEBHOOK_BIND="$(grep -E '^SUPPORT_WEBHOOK_BIND=' .env 2>/dev/null | cut -d= -f2-)"
+fi
+
+SUPPORT_PROJECT_DIR=""
+SUPPORT_GROUP_ID=""
+SUPABASE_URL=""
+SUPABASE_KEY=""
+SUPPORT_WEBHOOK_TOKEN=""
+SUPPORT_WEBHOOK_PORT=""
+SUPPORT_WEBHOOK_BIND=""
+
+DEFAULT_SUPPORT="N"
+[ -n "$EXISTING_PROJECT_DIR" ] && DEFAULT_SUPPORT="Y"
+
+ENABLE_SUPPORT="$(ask "Enable support-ticket investigation? [y/N]" "$DEFAULT_SUPPORT")"
+if [[ "$ENABLE_SUPPORT" =~ ^[Yy] ]]; then
+    SUPPORT_PROJECT_DIR="$(ask "Local path to the codebase to investigate" "${EXISTING_PROJECT_DIR:-$HOME/code/my-app}")"
+
+    echo
+    echo "  ${D}Telegram group: the bot creates a forum topic per ticket here.${N}"
+    echo "  ${D}Add the bot to a forum-enabled group, then in the group send /status${N}"
+    echo "  ${D}to read the chat id (a negative number).${N}"
+    SUPPORT_GROUP_ID="$(ask "Telegram support group id (negative number)" "$EXISTING_GROUP_ID")"
+
+    echo
+    echo "  ${D}Supabase (the bot reads/writes tickets, attachments, and reply notes here):${N}"
+    SUPABASE_URL="$(ask "Supabase project URL (https://xxx.supabase.co)" "$EXISTING_SUPABASE_URL")"
+    if [ -n "$EXISTING_SUPABASE_KEY" ]; then
+        KEEP_KEY="$(ask "Reuse existing service-role key from .env? [Y/n]" "Y")"
+        if [[ "$KEEP_KEY" =~ ^[Nn] ]]; then
+            SUPABASE_KEY="$(ask_secret "Supabase service-role key")"
+        else
+            SUPABASE_KEY="$EXISTING_SUPABASE_KEY"
+        fi
+    else
+        SUPABASE_KEY="$(ask_secret "Supabase service-role key")"
+    fi
+
+    echo
+    echo "  ${B}Webhook listener${N} — your web app POSTs new tickets here for instant"
+    echo "  dispatch (instead of waiting for the 20s Supabase poll)."
+    SUPPORT_WEBHOOK_PORT="$(ask "Local port for the webhook" "${EXISTING_WEBHOOK_PORT:-9091}")"
+    SUPPORT_WEBHOOK_BIND="$(ask "Bind address (127.0.0.1 = local-only; 0.0.0.0 = public)" "${EXISTING_WEBHOOK_BIND:-127.0.0.1}")"
+
+    if [ -n "$EXISTING_WEBHOOK_TOKEN" ]; then
+        REGEN="$(ask "Webhook token already exists in .env — regenerate? [y/N]" "N")"
+        if [[ "$REGEN" =~ ^[Yy] ]]; then
+            SUPPORT_WEBHOOK_TOKEN="$(openssl rand -hex 32 2>/dev/null || python3 -c 'import secrets;print(secrets.token_hex(32))')"
+        else
+            SUPPORT_WEBHOOK_TOKEN="$EXISTING_WEBHOOK_TOKEN"
+        fi
+    else
+        SUPPORT_WEBHOOK_TOKEN="$(openssl rand -hex 32 2>/dev/null || python3 -c 'import secrets;print(secrets.token_hex(32))')"
+    fi
+
+    echo
+    ok "Webhook URL: ${B}http://${SUPPORT_WEBHOOK_BIND}:${SUPPORT_WEBHOOK_PORT}/support-ticket${N}"
+    ok "Webhook token: ${B}${SUPPORT_WEBHOOK_TOKEN}${N}"
+    echo
+    echo "  ${D}Configure your web app to POST tickets like this:${N}"
+    echo "    ${D}curl -X POST http://${SUPPORT_WEBHOOK_BIND}:${SUPPORT_WEBHOOK_PORT}/support-ticket \\${N}"
+    echo "    ${D}  -H 'Authorization: Bearer ${SUPPORT_WEBHOOK_TOKEN}' \\${N}"
+    echo "    ${D}  -H 'Content-Type: application/json' \\${N}"
+    echo "    ${D}  -d '{\"id\":\"<ticket-uuid>\", \"user_name\":\"...\", \"user_email\":\"...\",${N}"
+    echo "    ${D}       \"message\":\"...\", \"current_page\":\"/...\", \"attachments\":[]}'${N}"
+    if [[ "$SUPPORT_WEBHOOK_BIND" == "127.0.0.1" ]]; then
+        echo
+        warn "Webhook is bound to localhost — only reachable from THIS machine."
+        echo "  ${D}If your web app runs elsewhere, either set bind=0.0.0.0 + open the${N}"
+        echo "  ${D}firewall, or front the port with cloudflared / ngrok / tailscale.${N}"
+    fi
+fi
+
+# ── Step 5: write .env ────────────────────────────────────────────────────────
+echo
+hr
+say "${B}Step 5 — Writing config${N}"
+
+# Preserve any existing keys we don't know about
+KNOWN_KEYS='^(TELEGRAM_BOT_TOKEN|ALLOWED_USER_ID|CLAUDE_WORKING_DIR|BOT_BACKEND|CLAUDE_MODEL|CODEX_MODEL|OLLAMA_MODEL|OLLAMA_HOST|OPENAI_API_KEY|XAI_API_KEY|SUPPORT_PROJECT_DIR|SUPPORT_GROUP_ID|SUPABASE_URL|SUPABASE_SERVICE_ROLE_KEY|SUPPORT_WEBHOOK_TOKEN|SUPPORT_WEBHOOK_PORT|SUPPORT_WEBHOOK_BIND|#)='
 PRESERVED=""
 if [ -f ".env" ]; then
-    PRESERVED="$(grep -vE '^(TELEGRAM_BOT_TOKEN|ALLOWED_USER_ID|CLAUDE_WORKING_DIR|BOT_BACKEND|CLAUDE_MODEL|CODEX_MODEL|OLLAMA_MODEL|OLLAMA_HOST|OPENAI_API_KEY|XAI_API_KEY|#)=' .env 2>/dev/null || true)"
+    PRESERVED="$(grep -vE "$KNOWN_KEYS" .env 2>/dev/null || true)"
 fi
 
 {
@@ -370,6 +469,17 @@ fi
     esac
     [ -n "$OPENAI_KEY" ] && echo "OPENAI_API_KEY=$OPENAI_KEY"
     [ -n "$XAI_KEY" ]    && echo "XAI_API_KEY=$XAI_KEY"
+    if [ -n "$SUPPORT_PROJECT_DIR" ]; then
+        echo
+        echo "# Support-ticket investigation"
+        echo "SUPPORT_PROJECT_DIR=$SUPPORT_PROJECT_DIR"
+        [ -n "$SUPPORT_GROUP_ID" ]      && echo "SUPPORT_GROUP_ID=$SUPPORT_GROUP_ID"
+        [ -n "$SUPABASE_URL" ]          && echo "SUPABASE_URL=$SUPABASE_URL"
+        [ -n "$SUPABASE_KEY" ]          && echo "SUPABASE_SERVICE_ROLE_KEY=$SUPABASE_KEY"
+        [ -n "$SUPPORT_WEBHOOK_PORT" ]  && echo "SUPPORT_WEBHOOK_PORT=$SUPPORT_WEBHOOK_PORT"
+        [ -n "$SUPPORT_WEBHOOK_BIND" ]  && echo "SUPPORT_WEBHOOK_BIND=$SUPPORT_WEBHOOK_BIND"
+        [ -n "$SUPPORT_WEBHOOK_TOKEN" ] && echo "SUPPORT_WEBHOOK_TOKEN=$SUPPORT_WEBHOOK_TOKEN"
+    fi
     if [ -n "$PRESERVED" ]; then
         echo
         echo "# Preserved from previous .env"
@@ -379,7 +489,7 @@ fi
 chmod 600 .env
 ok ".env written (mode 600)"
 
-# ── Step 5: Python deps in a venv ─────────────────────────────────────────────
+# ── Step 6: Python deps in a venv ─────────────────────────────────────────────
 say "Setting up Python venv & installing dependencies..."
 if [ ! -d "venv" ]; then
     python3 -m venv venv

@@ -89,6 +89,29 @@ or `/model` (preserves Codex history; only works from Codex).
 The bot defaults each new chat to whatever `BOT_BACKEND=` is in `.env`. You can
 still flip backends at runtime per-chat with `/codex` and `/ollama`.
 
+## Support-ticket investigation (optional)
+
+If you maintain a codebase and want the bot to auto-investigate support
+tickets, the installer's Step 4 wires this up: it asks for the local path to
+the codebase, a Telegram forum group id, Supabase creds (where tickets live),
+and stands up a webhook listener so your web app can POST new tickets for
+instant dispatch instead of waiting for the 20-second poll.
+
+The webhook accepts:
+
+```
+POST http://<bind>:<port>/support-ticket
+Authorization: Bearer <SUPPORT_WEBHOOK_TOKEN>
+Content-Type: application/json
+{ "id": "<uuid>", "user_name": "...", "user_email": "...",
+  "message": "...", "current_page": "...", "attachments": [] }
+```
+
+On receipt the bot creates a forum topic, posts the ticket, downloads any
+attachments from Supabase storage, marks it dispatched, and kicks off a Claude
+investigation in that topic. Polling still runs as a fallback when Supabase is
+configured.
+
 ## Env vars
 
 See `.env.example` for the full list. Required:
@@ -103,3 +126,7 @@ Useful optional:
 - `CLAUDE_WORKING_DIR` — default cwd for AI commands (defaults to `~`)
 - `OPENAI_API_KEY` — enables voice-message transcription via Whisper
 - `XAI_API_KEY` — enables TTS voice replies via Grok Ara
+- `SUPPORT_PROJECT_DIR`, `SUPPORT_GROUP_ID`, `SUPABASE_URL`,
+  `SUPABASE_SERVICE_ROLE_KEY` — enable the support-ticket poller
+- `SUPPORT_WEBHOOK_PORT`, `SUPPORT_WEBHOOK_TOKEN`, `SUPPORT_WEBHOOK_BIND`
+  — enable the webhook listener on top of the poller
