@@ -16,8 +16,10 @@ curl -fsSL https://raw.githubusercontent.com/RussellPetty/Super-Bot-Telegram/mas
 ```
 
 The installer is interactive: it picks a backend, installs the CLI for it, walks
-you through login, lets you choose a model, then asks for your Telegram bot
-token + user id. When it's done you can start the bot immediately.
+you through login, lets you choose a model, then handles the Telegram side via
+the Bot API — validates your token, sets the bot's command menu and description,
+and **auto-detects your user id** by waiting for you to tap Start in the bot's
+chat. The only manual step is pasting the token from @BotFather.
 
 To install into a custom directory:
 
