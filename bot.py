@@ -46,7 +46,11 @@ DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7[1m]")
 
 HOMI_REPLY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "homi_reply.py")
 
-# Ollama backend (used when state.ollama_mode is True or BOT_BACKEND=ollama)
+# Ollama backend. When state.ollama_mode is True the bot still shells out to the
+# `claude` CLI, but with ANTHROPIC_BASE_URL pointed at Ollama and --model set to
+# OLLAMA_MODEL — so you get the full Claude Code agentic loop (tools, file edits,
+# session resume) driven by a local model. Requires `ollama` >= 0.15 (exposes the
+# Anthropic API on the same port) and a tool-capable model with a ≥64k context.
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
 
@@ -111,7 +115,6 @@ class ChatState:
     codex_history: list[str] = field(default_factory=list)
     pending_codex_context: str | None = None
     ollama_mode: bool = False
-    ollama_messages: list[dict] = field(default_factory=list)
     stop_requested: bool = False
     pending_text: list[str] = field(default_factory=list)
     debounce_task: asyncio.Task | None = None
@@ -143,10 +146,12 @@ def get_state(chat_id: int, thread_id: int | None = None) -> ChatState:
 
 
 async def dispatch_to_backend(prompt, chat, reply_to, state, thread_id=None, voice_reply=False):
-    """Route a prompt to whichever backend this chat is currently in."""
-    if state.ollama_mode:
-        await run_ollama_streaming(prompt, chat, reply_to, state, thread_id=thread_id, voice_reply=voice_reply)
-    elif state.codex_mode:
+    """Route a prompt to whichever backend this chat is currently in.
+
+    Ollama mode is handled inside run_claude_streaming (env vars + --model) — the
+    bot only has two real runners now: claude (incl. claude-via-ollama) and codex.
+    """
+    if state.codex_mode:
         await run_codex_streaming(prompt, chat, reply_to, state, thread_id=thread_id, voice_reply=voice_reply)
     else:
         await run_claude_streaming(prompt, chat, reply_to, state, thread_id=thread_id, voice_reply=voice_reply)
@@ -386,15 +391,29 @@ async def run_claude_streaming(
         prompt = state.pending_codex_context + "\n\nUser's new message: " + prompt
         state.pending_codex_context = None
 
+    # In ollama mode we still drive the `claude` CLI, but point it at the local
+    # Ollama server (which now exposes the Anthropic API) and force the model to
+    # the user's local Ollama model.
+    if state.ollama_mode:
+        model = state.model_override or OLLAMA_MODEL
+    else:
+        model = state.model_override or DEFAULT_MODEL
+
     cmd = [
         "claude", "-p", prompt,
         "--dangerously-skip-permissions",
         "--output-format", "stream-json",
         "--verbose",
+        "--model", model,
     ]
-    cmd.extend(["--model", state.model_override or DEFAULT_MODEL])
     if state.session_id:
         cmd.extend(["--resume", state.session_id])
+
+    env = os.environ.copy()
+    if state.ollama_mode:
+        env["ANTHROPIC_BASE_URL"] = OLLAMA_HOST
+        env["ANTHROPIC_AUTH_TOKEN"] = "ollama"
+        env["ANTHROPIC_API_KEY"] = ""  # explicit empty so any inherited real key doesn't override
 
     if reply_to is not None:
         try:
@@ -408,6 +427,7 @@ async def run_claude_streaming(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd_override or working_dir_for(chat.id),
+            env=env,
             limit=10 * 1024 * 1024,  # 10 MB line limit for large JSON output
         )
         state.active_proc = proc
@@ -527,13 +547,16 @@ async def run_codex_streaming(
     cwd = working_dir_for(chat.id)
     cmd = ["codex", "exec"]
     # Resume the same Codex session so multi-turn context carries across messages.
+    # `codex exec resume` does not accept -C; the subprocess cwd below sets the
+    # working directory for both paths, and codex filters resumable sessions by cwd.
     if state.codex_thread_id:
         cmd.append("resume")
     cmd.extend([
         "--dangerously-bypass-approvals-and-sandbox",
         "--json",
-        "-C", cwd,
     ])
+    if not state.codex_thread_id:
+        cmd.extend(["-C", cwd])
     if state.model_override:
         cmd.extend(["-m", state.model_override])
     if state.codex_thread_id:
@@ -650,95 +673,6 @@ async def run_codex_streaming(
             pass
 
 
-async def run_ollama_streaming(
-    prompt: str,
-    chat,
-    reply_to,
-    state: ChatState,
-    thread_id: int | None = None,
-    voice_reply: bool = False,
-) -> None:
-    """Stream a chat completion from a local Ollama server.
-
-    Maintains chat history in state.ollama_messages so the model gets multi-turn context.
-    Ollama itself doesn't expose tools/agentic behavior — it's plain chat.
-    """
-    model = state.model_override or OLLAMA_MODEL
-    state.ollama_messages.append({"role": "user", "content": prompt})
-
-    if reply_to is not None:
-        try:
-            await reply_to.set_reaction(ReactionTypeEmoji("👍"))
-        except Exception as e:
-            logger.error("Failed to set reaction: %s", e)
-
-    typing_active = True
-
-    async def keep_typing():
-        while typing_active:
-            try:
-                await chat.send_action(ChatAction.TYPING, message_thread_id=thread_id)
-            except Exception:
-                pass
-            await asyncio.sleep(8)
-
-    typing_task = asyncio.create_task(keep_typing())
-
-    full_response = ""
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
-            async with client.stream(
-                "POST",
-                f"{OLLAMA_HOST}/api/chat",
-                json={
-                    "model": model,
-                    "messages": state.ollama_messages,
-                    "stream": True,
-                },
-            ) as resp:
-                if resp.status_code >= 400:
-                    body = await resp.aread()
-                    raise RuntimeError(f"Ollama returned {resp.status_code}: {body.decode(errors='replace')[:500]}")
-                async for line in resp.aiter_lines():
-                    if state.stop_requested:
-                        break
-                    if not line.strip():
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    chunk = (event.get("message") or {}).get("content", "")
-                    if chunk:
-                        full_response += chunk
-                    if event.get("done"):
-                        break
-    except Exception as e:
-        logger.error("Ollama request failed: %s", e, exc_info=True)
-        await chat.send_message(f"❌ Ollama error: {e}", message_thread_id=thread_id)
-        # Drop the failed turn from history so the next message doesn't carry a dangling user turn
-        if state.ollama_messages and state.ollama_messages[-1].get("role") == "user":
-            state.ollama_messages.pop()
-        full_response = ""
-    finally:
-        typing_active = False
-        typing_task.cancel()
-        try:
-            await typing_task
-        except asyncio.CancelledError:
-            pass
-        state.stop_requested = False
-
-    if not full_response.strip():
-        return
-
-    state.ollama_messages.append({"role": "assistant", "content": full_response})
-    if voice_reply:
-        await send_tts_voice(chat, full_response, state, thread_id=thread_id)
-    else:
-        await send_chunks(chat, full_response, state, thread_id=thread_id)
-
-
 async def run_terminal_command(command: str, chat, reply_to, state: ChatState, thread_id: int | None = None) -> None:
     """Run a shell command and relay output back to the chat."""
     working_msg = await reply_to.reply_text(f"🖥️ Running: `{command}`", parse_mode="Markdown")
@@ -792,7 +726,6 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     state.codex_history = []
     state.pending_codex_context = None
     state.ollama_mode = (DEFAULT_BACKEND == "ollama")
-    state.ollama_messages = []
     state.announce_next_session_id = True
 
     chat_id = update.message.chat_id
@@ -1012,11 +945,13 @@ async def ollama_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     state.ollama_mode = True
     state.codex_mode = False
-    state.ollama_messages = []
+    state.session_id = None  # any prior Anthropic-cloud session won't resume against Ollama
 
     msg = await update.message.reply_text(
-        f"🦙 Switched to **Ollama** mode (model: `{state.model_override or OLLAMA_MODEL}`).\n\n"
-        f"Use /model to pick a different installed model, or `/new` to swap back to the default backend.",
+        f"🦙 Switched to **Ollama** mode (model: `{state.model_override or OLLAMA_MODEL}` via Claude Code).\n\n"
+        f"You get the full Claude Code agentic loop — tools, file edits, session resume — "
+        f"but the model running it is local. Use /model to pick a different installed model, "
+        f"or /new to swap back to the default backend.",
         parse_mode="Markdown",
     )
     state.sent_message_ids.append(msg.message_id)
@@ -1174,9 +1109,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         prompt = f"Read the image at {img_path} and describe what you see."
 
-    if state.ollama_mode:
-        # Most local models can't read images from disk paths. Note this and skip the file read.
-        prompt = f"[user sent an image; saved at {img_path} but you can't read local files] " + prompt
     await dispatch_to_backend(prompt, update.message.chat, update.message, state, thread_id=thread_id)
 
 
@@ -1201,14 +1133,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         prompt = f"Read the file at {doc_path} and describe its contents."
 
-    if state.ollama_mode:
-        # Ollama can't read arbitrary local files; inline a short snippet instead.
-        try:
-            with open(doc_path, "r", encoding="utf-8", errors="replace") as f:
-                snippet = f.read(8000)
-            prompt = f"User sent a file ({filename}). Contents (first 8000 chars):\n\n{snippet}\n\nUser says: {caption or '(no caption)'}"
-        except Exception as e:
-            prompt = f"[user sent file {filename} but it couldn't be read as text: {e}] caption: {caption}"
     await dispatch_to_backend(prompt, update.message.chat, update.message, state, thread_id=thread_id)
 
 

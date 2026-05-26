@@ -8,9 +8,16 @@ the human in the loop.
 
 ## What this is
 
-A Telegram bot that bridges messages to Claude Code / Codex / Ollama, plus an
-optional HTTP webhook for support-ticket investigation that can serve any
-number of codebases.
+A Telegram bot that bridges messages to Claude Code or Codex, plus an optional
+HTTP webhook for support-ticket investigation that can serve any number of
+codebases.
+
+The "Ollama" backend choice is **not a separate runner** — it still drives the
+Claude Code CLI, but with `ANTHROPIC_BASE_URL` pointed at the local Ollama
+server (which exposes the Anthropic API) and `--model` set to an installed
+Ollama model. You get the full agentic loop (tools, file edits, session resume);
+the only thing that changes is which model produces the tokens. Requires
+`ollama` ≥ 0.15 and a tool-capable local model with a ≥64k context window.
 
 Key files:
 - `bot.py` — the bot itself (PTB 21, asyncio, aiohttp for the webhook)

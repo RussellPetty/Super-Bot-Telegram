@@ -114,7 +114,7 @@ hr
 say "${B}Step 1 — Choose AI backend${N}"
 echo "  1) ${C}Claude Code${N}  — Anthropic's claude CLI (best agentic tools)"
 echo "  2) ${C}Codex${N}        — OpenAI's codex CLI"
-echo "  3) ${C}Ollama${N}       — local models on your machine (private, free, slower)"
+echo "  3) ${C}Ollama${N}       — local models running the Claude Code loop (private, free, slower; needs a tool-capable model)"
 echo
 BACKEND_NUM="$(ask "Pick 1, 2, or 3" "1")"
 case "$BACKEND_NUM" in
@@ -226,15 +226,47 @@ case "$BACKEND" in
             exit 1
         fi
 
+        # The bot drives the Claude Code CLI even in ollama mode (Ollama exposes
+        # the Anthropic API on the same port), so we need `claude` installed too.
+        ensure_node "Claude Code (used to drive Ollama)"
+        if ! have claude; then
+            say "Installing Claude Code (@anthropic-ai/claude-code)..."
+            npm install -g @anthropic-ai/claude-code
+        fi
+        ok "Claude Code: $(claude --version 2>/dev/null | head -1 || echo installed)"
+
         echo
         say "Installed Ollama models:"
         ollama list || true
-        echo
-        echo "${D}Browse models: https://ollama.com/library${N}"
-        echo "${D}Examples: llama3.2, qwen2.5:14b, gpt-oss:20b, deepseek-r1:8b${N}"
-        MODEL="$(ask "Model name (will pull if not present)" "llama3.2")"
+
+        # `ollama list` output: header row + one row per installed model.
+        # If only the header is present (or list failed), the user has nothing
+        # installed locally and we default to a cloud model so they don't have
+        # to wait for a multi-GB download.
+        INSTALLED_COUNT=$(ollama list 2>/dev/null | tail -n +2 | grep -c . || echo 0)
+        if [ "$INSTALLED_COUNT" -eq 0 ]; then
+            DEFAULT_OLLAMA_MODEL="kimi-k2.6:cloud"
+            echo
+            echo "${D}No local models installed — defaulting to Ollama Cloud's kimi-k2.6:cloud${N}"
+            echo "${D}(hosted by Ollama, no download, full context). Local picks like${N}"
+            echo "${D}qwen2.5-coder:14b also work if you'd rather run on-device.${N}"
+        else
+            DEFAULT_OLLAMA_MODEL="qwen2.5-coder:14b"
+            echo
+            echo "${D}Browse models: https://ollama.com/library${N}"
+            echo "${D}Tool-capable picks: qwen2.5-coder:14b, llama3.1:8b, gpt-oss:20b${N}"
+            echo "${D}Or use Ollama Cloud (no download): kimi-k2.6:cloud${N}"
+        fi
+        echo "${D}Heads-up: local models need a >=64k context window (set OLLAMA_NUM_CTX${N}"
+        echo "${D}on 'ollama serve', or in the Modelfile) or Claude Code will truncate its${N}"
+        echo "${D}tool prompts and the agent loop will break. Cloud models already have it.${N}"
+        MODEL="$(ask "Model name (will pull if not present)" "$DEFAULT_OLLAMA_MODEL")"
         say "Pulling $MODEL (skipped if already present)..."
-        ollama pull "$MODEL"
+        if ! ollama pull "$MODEL"; then
+            warn "Pulling '$MODEL' failed — falling back to Ollama Cloud's kimi-k2.6:cloud."
+            MODEL="kimi-k2.6:cloud"
+            ollama pull "$MODEL"
+        fi
         ok "Model $MODEL ready"
         ;;
 esac
