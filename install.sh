@@ -337,7 +337,22 @@ if [ -z "$USER_ID" ]; then
     esac
 fi
 
-WORK_DIR="$(ask "Default working directory for AI commands" "$HOME")"
+while true; do
+    WORK_DIR="$(ask "Default working directory for AI commands" "$HOME")"
+    case "$WORK_DIR" in
+        /*)  ;;  # absolute path — good
+        *)
+            warn "Path must be absolute (start with /). You entered: $WORK_DIR"
+            continue
+            ;;
+    esac
+    if [ ! -d "$WORK_DIR" ]; then
+        warn "Directory does not exist: $WORK_DIR"
+        KEEP_ANYWAY="$(ask "Use it anyway? [y/N]" "N")"
+        [[ "$KEEP_ANYWAY" =~ ^[Yy] ]] || continue
+    fi
+    break
+done
 
 echo
 echo "${D}Optional add-ons (press Enter to skip):${N}"
@@ -386,7 +401,19 @@ DEFAULT_SUPPORT="N"
 
 ENABLE_SUPPORT="$(ask "Enable support-ticket investigation? [y/N]" "$DEFAULT_SUPPORT")"
 if [[ "$ENABLE_SUPPORT" =~ ^[Yy] ]]; then
-    SUPPORT_PROJECT_DIR="$(ask "Default codebase path (per-ticket payload can override)" "${EXISTING_PROJECT_DIR:-$HOME/code/my-app}")"
+    while true; do
+        SUPPORT_PROJECT_DIR="$(ask "Default codebase path (per-ticket payload can override)" "${EXISTING_PROJECT_DIR:-$HOME/code/my-app}")"
+        case "$SUPPORT_PROJECT_DIR" in
+            /*)  ;;
+            *) warn "Path must be absolute (start with /). You entered: $SUPPORT_PROJECT_DIR"; continue ;;
+        esac
+        if [ ! -d "$SUPPORT_PROJECT_DIR" ]; then
+            warn "Directory does not exist: $SUPPORT_PROJECT_DIR"
+            KEEP_ANYWAY="$(ask "Use it anyway? [y/N]" "N")"
+            [[ "$KEEP_ANYWAY" =~ ^[Yy] ]] || continue
+        fi
+        break
+    done
 
     echo
     echo "  ${D}Telegram group: the bot creates a forum topic per ticket here.${N}"
